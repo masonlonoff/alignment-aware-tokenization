@@ -1,0 +1,10 @@
+[project]
+name = "alignment_aware_tokenization"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.isort]
+profile = "black"
+[tool.black]
+line-length = 100

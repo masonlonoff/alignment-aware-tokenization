@@ -1,0 +1,3 @@
+attack: "data/attack.jsonl"
+benign: "data/benign.jsonl"
+hazard_threshold_std: 1.0
