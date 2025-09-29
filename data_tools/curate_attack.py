@@ -84,16 +84,16 @@ Non-Goals
 Acceptance Tests
 ----------------
 1) JBV only:
-   $ python scripts/curate_attack.py --run jbv --n-jbv 200 --out-jbv /tmp/jbv.jsonl
+   $ python scripts/curate_attack.py --run jbv --n-jbv 200 --out-jbv data/eval/jbv.jsonl
    - Produces ~200 lines, prints "[done] JailbreakV-28K/..." message.
 
 2) AdvBench only (with token):
    $ huggingface-cli login
-   $ python scripts/curate_attack.py --run adv --n-adv 100 --out-adv /tmp/adv.jsonl
+   $ python scripts/curate_attack.py --run adv --n-adv 100 --out-adv data/eval/adv.jsonl
    - Produces ~100 lines, prints "[done] walledai/AdvBench ..." message.
 
 3) AdvBench without token:
-   $ python scripts/curate_attack.py --run adv --n-adv 100 --out-adv /tmp/adv.jsonl
+   $ python scripts/curate_attack.py --run adv --n-adv 100 --out-adv data/eval/adv.jsonl
    - Prints a warning and writes 0 lines; JBV is not run.
 
 4) Both (default):
