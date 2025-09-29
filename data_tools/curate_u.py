@@ -162,13 +162,13 @@ CLI Arguments
 Examples
 --------
 # 500 MB of English C4 (train)
-python scripts/curate_u_stream_cap.py --dataset allenai/c4 --config en --split train --target-mb 500
+python data_tools/curate_u_stream_cap.py --dataset allenai/c4 --config en --split train --target-mb 500
 
 # 500 MB of Pile (may need login + trust_remote_code)
-python scripts/curate_u_stream_cap.py --dataset EleutherAI/pile --config all --split train --target-mb 500 --trust-remote-code
+python data_tools/curate_u_stream_cap.py --dataset EleutherAI/pile --config all --split train --target-mb 500 --trust-remote-code
 
 # 500 MB of Pile Uncopyrighted (no custom code)
-python scripts/curate_u_stream_cap.py --dataset monology/pile-uncopyrighted --split train --target-mb 500
+python data_tools/curate_u_stream_cap.py --dataset monology/pile-uncopyrighted --split train --target-mb 500
 """
 
 import json
