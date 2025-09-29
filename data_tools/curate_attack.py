@@ -97,7 +97,7 @@ Acceptance Tests
    - Prints a warning and writes 0 lines; JBV is not run.
 
 4) Both (default):
-   $ python scripts/curate_attack.py
+   $ python data_tools/curate_attack.py
    - Runs both; honors --n-adv and --n-jbv defaults and out paths.
 
 5) Text-field fallback:
