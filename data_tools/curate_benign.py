@@ -4,9 +4,10 @@ CURATE_BENIGN — IMPLEMENTATION SPEC (READ FIRST)
 
 Goal
 -----
-Produce a small CLI that curates *benign* prompts from public HF datasets and
-writes them to JSONL for evaluation. The script should filter out obviously
-unsafe/toxic terms and (for RTP) exclude prompts with non-trivially high
+Produce a small Command Line Tool that curates *benign* prompts from two public HuggingFace datasets
+(databricks/databricks-dolly-15k & allenai/real-toxicity-prompts) and
+writes them to JSONL for evaluation. At the end we will have "safe" prompts.
+The script should filter out obviously unsafe/toxic terms for both datasets and (for RTP) exclude prompts with non-trivially high
 toxicity scores.
 
 Datasets (initial)
@@ -32,9 +33,9 @@ Filtering Rules
     drugs, terror, hate, extrem*, violent
   (case-insensitive; see EXCLUDE_RE below)
 
-- OPTIONAL niceties (documented, not required):
+- OPTIONAL niceties (documented, not required, but included here):
   * Trim whitespace; skip empty strings
-  * Minimum length threshold (e.g., ≥ 8 characters) if it helps avoid junk
+  * Minimum length threshold (≥ 8 characters) to avoid junk
 
 Output
 ------
@@ -108,9 +109,10 @@ import re
 import json
 import random
 import argparse
-from typing import Optional
+from pathlib import Path
 
 SEED = 9172
+MIN_LEN = 8  # optional nicety (enforced here)
 
 # Keep this exclude list stable; collaborators should not weaken it without review.
 EXCLUDE_RE = re.compile(
@@ -118,66 +120,81 @@ EXCLUDE_RE = re.compile(
     re.I
 )
 
+def _ensure_parent_dir(path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+def _write_jsonl(rows, out_path: str, source: str) -> int:
+    """Write list[str] to JSONL with fields (text,label,source). Returns #lines."""
+    _ensure_parent_dir(out_path)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for t in rows:
+            f.write(json.dumps({"text": t, "label": "benign", "source": source}, ensure_ascii=False) + "\n")
+    return len(rows)
 
 def dump_dolly(n: int, out: str, seed: int = SEED) -> None:
-    """
-    TODO: Implement Dolly curation as specified in the module docstring.
+    ds = load_dataset("databricks/databricks-dolly-15k", split="train")
+    rows = []
+    for ex in ds:
+        t = (ex.get("instruction") or "").strip()
+        if not t:
+            continue
+        if len(t) < MIN_LEN:  # nicety: skip junky/ultra-short prompts
+            continue
+        if EXCLUDE_RE.search(t):
+            continue
+        rows.append(t)
 
-    Steps:
-      - ds = load_dataset("databricks/databricks-dolly-15k", split="train")
-      - For each example:
-          * t = (ex.get("instruction") or "").strip()
-          * if not t: continue
-          * if EXCLUDE_RE.search(t): continue
-          * collect t
-      - random.seed(seed); random.shuffle(rows); rows = rows[:n]
-      - Write JSONL to `out`: {"text": t, "label": "benign", "source": "dolly-15k"}
-      - Print summary: f"[done] dolly → {out} ({len(rows)} lines)"
-    """
-    raise NotImplementedError
+    random.seed(seed)
+    random.shuffle(rows)
+    rows = rows[: max(0, int(n))]
 
+    written = _write_jsonl(rows, out, source="dolly-15k")
+    print(f"[done] dolly → {out} ({written} lines)")
 
 def dump_rtp(n: int, out: str, tox_thresh: float = 0.2, seed: int = SEED) -> None:
-    """
-    TODO: Implement Real Toxicity Prompts curation as specified.
+    ds = load_dataset("allenai/real-toxicity-prompts", split="train")
+    rows = []
+    for ex in ds:
+        prompt_obj = ex.get("prompt") or {}
+        t = (prompt_obj.get("text") or "").strip()
+        if not t:
+            continue
+        if len(t) < MIN_LEN:  # nicety
+            continue
 
-    Steps:
-      - ds = load_dataset("allenai/real-toxicity-prompts", split="train")
-      - For each example:
-          * t = (ex.get("prompt") or {}).get("text", "").strip()
-          * tox = ex.get("toxicity", None)
-          * if not t: continue
-          * if isinstance(tox, float) and tox > tox_thresh: continue
-          * if EXCLUDE_RE.search(t): continue
-          * collect t
-      - random.seed(seed); random.shuffle(rows); rows = rows[:n]
-      - Write JSONL to `out`: {"text": t, "label": "benign", "source": "real-toxicity-prompts"}
-      - Print summary: f"[done] rtp → {out} ({len(rows)} lines)"
-    """
-    raise NotImplementedError
+        tox = ex.get("toxicity", None)
+        # Treat ints as numbers too; exclude only if numeric and above threshold
+        if isinstance(tox, (int, float)) and float(tox) > float(tox_thresh):
+            continue
 
+        if EXCLUDE_RE.search(t):
+            continue
+
+        rows.append(t)
+
+    random.seed(seed)
+    random.shuffle(rows)
+    rows = rows[: max(0, int(n))]
+
+    written = _write_jsonl(rows, out, source="real-toxicity-prompts")
+    print(f"[done] rtp → {out} ({written} lines)")
 
 def main() -> None:
-    """
-    TODO: Wire up the CLI and run the selected path(s).
+    parser = argparse.ArgumentParser(description="Curate benign prompts from Dolly and RTP datasets.")
+    parser.add_argument("--n-dolly", type=int, default=1500, help="Max samples from Dolly (default: 1500)")
+    parser.add_argument("--n-rtp", type=int, default=500, help="Max samples from RTP (default: 500)")
+    parser.add_argument("--out-dolly", type=str, default="data/eval/benign_1500.jsonl", help="Output path for Dolly prompts")
+    parser.add_argument("--out-rtp", type=str, default="data/eval/benign_rtp_extra_500.jsonl", help="Output path for RTP prompts")
+    parser.add_argument("--run", choices=["both", "dolly", "rtp"], default="both", help="Which dataset(s) to curate")
+    parser.add_argument("--seed", type=int, default=SEED, help="Random seed")
+    parser.add_argument("--tox-thresh", type=float, default=0.2, help="Toxicity threshold for RTP")
+    args = parser.parse_args()
 
-    CLI:
-      --n-dolly    (int, default 1500)
-      --n-rtp      (int, default 500)
-      --out-dolly  (str, default data/eval/benign_1500.jsonl)
-      --out-rtp    (str, default data/eval/benign_rtp_extra_500.jsonl)
-      --run        (choices: both|dolly|rtp, default both)
-      --seed       (int, default 9172)
-      --tox-thresh (float, default 0.2)
-
-    Behavior:
-      - Parse args.
-      - If args.run in ('both','dolly') and args.n-dolly > 0: call dump_dolly(args.n_dolly, args.out_dolly, args.seed)
-      - If args.run in ('both','rtp')   and args.n-rtp   > 0: call dump_rtp(args.n_rtp, args.out_rtp, args.tox_thresh, args.seed)
-      - Exit 0.
-    """
-    raise NotImplementedError
-
+    if args.run in ("both", "dolly") and args.n_dolly > 0:
+        dump_dolly(args.n_dolly, args.out_dolly, args.seed)
+    if args.run in ("both", "rtp") and args.n_rtp > 0:
+        dump_rtp(args.n_rtp, args.out_rtp, args.tox_thresh, args.seed)
 
 if __name__ == "__main__":
     main()
+    
