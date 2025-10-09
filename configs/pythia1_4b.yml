@@ -1,0 +1,23 @@
+model_name: "EleutherAI/pythia-1.4b"
+precision: "bf16"
+seed: 1234
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["Wqkv", "out_proj", "fc_in", "fc_out"]
+train:
+  lr: 2.0e-4
+  batch_size: 32
+  steps: 2500
+  warmup_steps: 150
+drift:
+  lambda: 0.5
+  margin: 0.2
+  layer: 18
+data:
+  unlabeled_stream: "data/unlabeled/u_train.jsonl"
+  anchors: "data/anchors/anchors_500.jsonl"
+  neutrals: "data/neutrals/neutrals_1000.jsonl"
+eval:
+  u_dev_sample: 30000
