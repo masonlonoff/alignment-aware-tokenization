@@ -15,7 +15,7 @@ drift:
   margin: 0.2
   layer: 10
 data:
-  unlabeled_stream: "segyges/OpenWebText2"
+  unlabeled_stream: "data/unlabeled/u_train.jsonl"
   anchors: "data/anchors.jsonl"
   neutrals: "data/neutral_lookalikes.jsonl"
 eval:
