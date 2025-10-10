@@ -1,6 +1,5 @@
 model_name: "EleutherAI/pythia-1.4b"
 precision: "bf16"
-seed: 1234
 lora:
   r: 16
   alpha: 32
