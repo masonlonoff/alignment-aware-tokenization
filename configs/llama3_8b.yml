@@ -1,0 +1,31 @@
+model_name: "meta-llama/Meta-Llama-3-8B"
+precision: "bf16"
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "up_proj",
+      "down_proj",
+      "gate_proj",
+    ]
+train:
+  lr: 1.5e-4
+  batch_size: 16
+  steps: 2000
+  warmup_steps: 150
+drift:
+  lambda: 0.5
+  margin: 0.2
+  layer: 16
+data:
+  unlabeled_stream: "data/unlabeled/u_train.jsonl"
+  anchors: "data/anchors/anchors_500.jsonl"
+  neutrals: "data/neutrals/neutrals_1000.jsonl"
+eval:
+  u_dev_sample: 20000
