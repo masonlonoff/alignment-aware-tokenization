@@ -1,1 +1,11 @@
+# ignore any JSONL files inside data/unlabeled/
 data/unlabeled/*.jsonl
+
+# ignore the benign-curation notebook
+data_tools/curate_benign.ipynb
+
+# ignore the instructins dataset
+data/eval/dolly_instructions_all.txt
+
+# ignore virtual environment folder
+.venv
