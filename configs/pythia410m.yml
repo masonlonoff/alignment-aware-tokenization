@@ -16,7 +16,7 @@ drift:
   layer: 10
 data:
   unlabeled_stream: "data/unlabeled/u_train.jsonl"
-  anchors: "data/anchors.jsonl"
-  neutrals: "data/neutral_lookalikes.jsonl"
+  anchors: "data/anchors/anchors.jsonl"
+  neutrals: "data/neutrals/neutrals_1000.jsonl"
 eval:
   u_dev_sample: 20000
