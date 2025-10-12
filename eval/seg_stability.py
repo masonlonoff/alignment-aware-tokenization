@@ -1,3 +1,4 @@
+# eval/seg_stability.py
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
@@ -63,8 +64,8 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-import torch
-from transformers import AutoTokenizer, PreTrainedTokenizerBase, set_seed
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from utils.seeding import set_global_seed
 
 
 # ----------------------------- Utilities ------------------------------------
@@ -350,7 +351,7 @@ def main():
     ap.add_argument("--seed", type=int, default=9172)
     args = ap.parse_args()
 
-    set_seed(args.seed)
+    set_global_seed(args.seed)
     tok = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
 
     # default small sample set if no JSONL provided
