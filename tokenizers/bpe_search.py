@@ -43,6 +43,7 @@ import argparse
 import json
 import math
 import os
+import glob
 import random
 from re import search
 import shutil
@@ -50,6 +51,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -59,7 +61,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 
 from eval.eval_perplexity import perplexity as eval_ppl
 from eval.eval_drift import drift_score as eval_drift
-from models.embed_remap import remap_embeddings
+from models.embed_remap import EmbeddingRemapper
 
 
 # ----------------------------
@@ -105,19 +107,64 @@ def read_jsonl_texts(path: str, key: str = "text", limit: int | None = None) -> 
     return out
 
 
-def sample_u_dev(dataset: str, n: int, seed: int) -> List[str]:
-    """
-    Sample a held-out slice from a HuggingFace dataset for ppl/tpc evaluation.
+def _iter_jsonl_file(path: str) -> Iterable[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            if not ln.strip():
+                continue
+            try:
+                j = json.loads(ln)
+                t = j.get("text") or j.get("prompt") or j.get("instruction") or j.get("question")
+            except Exception:
+                t = ln
+            if isinstance(t, str) and t.strip():
+                yield t.strip()
 
-    Args:
-        dataset: HF dataset name (split must support "train").
-        n:       Sample size (capped by dataset length).
-        seed:    Shuffle seed.
 
-    Returns:
-        A list of `text` fields.
+def _load_local_texts(spec: str) -> list[str]:
+    # spec can be a file, dir, or glob
+    if os.path.isfile(spec):
+        return list(_iter_jsonl_file(spec))
+    if os.path.isdir(spec):
+        # prefer u_dev.jsonl if present; else take all *.jsonl
+        cand = os.path.join(spec, "u_dev.jsonl")
+        files = [cand] if os.path.isfile(cand) else sorted(glob.glob(os.path.join(spec, "*.jsonl")))
+        out = []
+        for fp in files:
+            out.extend(_iter_jsonl_file(fp))
+        return out
+    # glob pattern
+    if any(ch in spec for ch in "*?[]"):
+        out = []
+        for fp in sorted(glob.glob(spec)):
+            out.extend(_iter_jsonl_file(fp))
+        return out
+    return []
+
+
+def sample_u_dev(dataset_or_path: str, n: int, seed: int) -> list[str]:
     """
-    ds = load_dataset(dataset, split="train").shuffle(seed=seed)
+    Accepts either a HF dataset id OR a local file/dir/glob.
+    - HF path → load_dataset(id, split='train')
+    - Local   → read jsonl(s)
+    """
+    # Try local first
+    local = _load_local_texts(dataset_or_path)
+    if local:
+        rng = np.random.RandomState(seed)
+        idx = rng.permutation(len(local))[: min(n, len(local))]
+        return [local[i] for i in idx]
+
+    # Fall back to HF dataset id
+    try:
+        ds = load_dataset(dataset_or_path, split="train")
+    except Exception:
+        # As a last resort: JSON builder if the string looks like a json/jsonl file
+        if dataset_or_path.lower().endswith((".jsonl", ".json")):
+            ds = load_dataset("json", data_files=dataset_or_path, split="train")
+        else:
+            raise
+    ds = ds.shuffle(seed=seed)
     n = min(n, len(ds))
     return [x.get("text", "") for x in ds.select(range(n))]
 
@@ -267,13 +314,13 @@ class TokenizerEditor:
         tie_lm_head: bool = True
     ) -> str:
         """
-        If remap_out is provided (non-empty), run remap_embeddings to create a stable
+        If remap_out is provided (non-empty), run EmbeddingRemapper to create a stable
         model+tokenizer bundle aligned to the edited tokenizer. Returns the directory
         path to use going forward (remapped dir if remapped, else edited_tok_dir).
         """
         if remap_out:
             os.makedirs(remap_out, exist_ok=True)
-            remap_embeddings(
+            EmbeddingRemapper(
                 base_model_dir=base_model_dir,
                 new_tokenizer_dir=str(edited_tok_dir),
                 save_dir=remap_out,
@@ -527,7 +574,10 @@ class JointScore(ScoreStrategy):
 
         ppl = eval_ppl(model, tok, self.u_dev_texts)
         tpc = tokens_per_char(tok, self.u_dev_texts)
-        drift = eval_drift(model, tok, self.neutrals, self.v, layer=self.drift_layer)
+
+        # drift_score returns an array; reduce to a scalar (mean)
+        _drift_arr = eval_drift(model, tok, self.neutrals, self.v, layer=self.drift_layer)
+        drift = float(np.mean(_drift_arr)) if len(_drift_arr) else 0.0
 
         J = (ppl / self.ppl0) + self.alpha * (drift / self.drift0) + self.beta * (tpc / self.tpc0)
         return ScoreResult(float(J), float(ppl), float(drift), float(tpc))
@@ -650,7 +700,7 @@ class BPESearch:
                     else:
                         save_target = ""  # temp use; no persistent bundle
 
-                    used_dir = save_and_optionally_remap(
+                    used_dir = TokenizerEditor.save_and_optionally_remap(
                         base_model_dir=self.model_name,         # HF repo id or local model dir
                         edited_tok_dir=Path(accepted_tok_dir),
                         remap_out=save_target,
@@ -683,7 +733,7 @@ def main():
                     help="LM id used for warmup/scoring; defaults to base_tokenizer")
     ap.add_argument("--anchors", required=True, help="JSONL with {text: ...} hazard anchors")
     ap.add_argument("--neutrals", required=True, help="JSONL with {text: ...} neutral look-alikes")
-    ap.add_argument("--u_dev_dataset", default="segyges/OpenWebText2",
+    ap.add_argument("--u_dev_dataset", default="data/unlabeled/u_dev.jsonl",
                     help="HF dataset for ppl/tpc dev slice")
     ap.add_argument("--u_dev_size", type=int, default=20000, help="Sample size for dev slice")
     ap.add_argument("--probe", required=True,
@@ -727,7 +777,9 @@ def main():
         np.load(args.probe + ".npy", allow_pickle=True) if os.path.exists(args.probe +
                                                                           ".npy") else np.load(args.probe, allow_pickle=True)
     )
-    drift0 = eval_drift(base_model, base_tok, neutrals, v, layer=args.drift_layer)
+    _drift0_arr = eval_drift(base_model, base_tok, neutrals, v, layer=args.drift_layer)
+    drift0 = float(np.mean(_drift0_arr)) if len(_drift0_arr) else 0.0
+    drift0 = drift0 if abs(drift0) > 1e-12 else 1e-12  # avoid divide-by-zero later
     print(f"[baseline norms] ppl0={ppl0:.3f} | tpc0={tpc0:.5f} | drift0={drift0:.5f}")
 
     scorer = JointScore(model_name, u_dev_texts, neutrals, args.probe,
@@ -755,7 +807,7 @@ def main():
         # Produce a final remapped model+tokenizer bundle aligned to the best merges
         final_tmp = Path(tempfile.mkdtemp(prefix="bpe_final_"))
         editor.write_edited(best_merges, final_tmp / "tok_final")
-        remap_embeddings(
+        EmbeddingRemapper(
             base_model_dir=model_name,                     # same LM used for scoring
             new_tokenizer_dir=str(final_tmp / "tok_final"),
             save_dir=args.remap_out,
