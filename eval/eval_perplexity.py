@@ -89,6 +89,7 @@ def _load_u_dev(spec: str, sample_n: int, seed: int) -> List[str]:
 
 @torch.no_grad()
 def perplexity(model, tok, texts: List[str], batch_size: int = 2, max_length: int = 128) -> float:
+    _ensure_pad(tok)
     device = model.device
     total_nll = 0.0
     total_tokens = 0
