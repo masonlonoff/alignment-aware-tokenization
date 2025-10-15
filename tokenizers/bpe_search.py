@@ -60,7 +60,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
 
 from eval.eval_perplexity import perplexity as eval_ppl
-from eval.eval_drift import drift_score as eval_drift
+from eval.eval_drift import concept_scores as eval_drift
 from models.embed_remap import EmbeddingRemapper
 
 
@@ -575,7 +575,7 @@ class JointScore(ScoreStrategy):
         ppl = eval_ppl(model, tok, self.u_dev_texts)
         tpc = tokens_per_char(tok, self.u_dev_texts)
 
-        # drift_score returns an array; reduce to a scalar (mean)
+        # concept_scores returns an array; reduce to a scalar (mean)
         _drift_arr = eval_drift(model, tok, self.neutrals, self.v, layer=self.drift_layer)
         drift = float(np.mean(_drift_arr)) if len(_drift_arr) else 0.0
 
