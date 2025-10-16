@@ -2,13 +2,13 @@
 set -euo pipefail
 BASE_TOK=${1:-"EleutherAI/pythia-410m"}
 MODEL_ID=${2:-$BASE_TOK}
-PROBE=${3:-"probes/v_layer.pt"}   # or .npy if you saved that way
+PROBE=${3:-"probes/v_layer.pt.npy"}   # or .npy if you saved that way
 python -m tokenizers.bpe_search \
   --base_tokenizer "$BASE_TOK" \
   --model_name "$MODEL_ID" \
-  --anchors data/anchors.jsonl \
-  --neutrals data/neutral_lookalikes.jsonl \
-  --u_dev_dataset segyges/OpenWebText2 \
+  --anchors data/anchors/anchors_500.jsonl \
+  --neutrals data/neutrals/neutrals_1000.jsonl \
+  --u_dev_dataset data/unlabeled/u_dev.jsonl \
   --u_dev_size 20000 \
   --probe "$PROBE" \
   --rounds 5 \
