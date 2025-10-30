@@ -60,7 +60,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
 
 from eval.eval_perplexity import perplexity as eval_ppl
-from eval.eval_drift import concept_scores as eval_drift
+from eval.eval_drift import drift_score as eval_drift
 from models.embed_remap import EmbeddingRemapper
 
 
@@ -267,10 +267,19 @@ class TokenizerEditor:
         model = obj.get("model", {})
         if model.get("type", "").lower() != "bpe":
             raise ValueError("Expected a BPE fast tokenizer (model.type != 'BPE').")
-        if "merges" not in model:
+        merges_raw = model.get("merges")
+        if not isinstance(merges_raw, list) or len(merges_raw) == 0:
             raise ValueError("No 'merges' array in tokenizer.json.")
 
-        self.baseline_merges: List[str] = list(model["merges"])
+        # Normalize to list[str] like "a b", and remember original format
+        if isinstance(merges_raw[0], list):
+            self._merges_format = "pairs"             # e.g., [["a","b"], ["c","d"], ...]
+            self.baseline_merges = [" ".join(p) for p in merges_raw]
+        elif isinstance(merges_raw[0], str):
+            self._merges_format = "strings"           # e.g., ["a b", "c d", ...]
+            self.baseline_merges = list(merges_raw)
+        else:
+            raise ValueError("Unsupported merges entry type.")
 
     def write_edited(self, merges: List[str], out_dir: Path) -> PreTrainedTokenizerFast:
         """
@@ -292,7 +301,10 @@ class TokenizerEditor:
 
         # Replace merges inside tokenizer.json
         obj = json.loads(self.tokjson_path.read_text(encoding="utf-8"))
-        obj["model"]["merges"] = merges
+        if getattr(self, "_merges_format", "strings") == "pairs":
+            obj["model"]["merges"] = [m.split(" ") for m in merges]   # back to [["a","b"], ...]
+        else:
+            obj["model"]["merges"] = merges                           # keep ["a b", ...]
         (out_dir / "tokenizer.json").write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
 
         # Load fast tokenizer from edited file
@@ -382,13 +394,19 @@ class RiskyMergePruner(CandidateGenerator):
         """
         risky = []
         for i, m in enumerate(merges):
-            parts = m.split()
-            if len(parts) != 2:
-                continue
-            cat = "".join(parts)
+            if not isinstance(m, str):
+                # handle accidental pair form
+                if isinstance(m, (list, tuple)) and len(m) == 2 and all(isinstance(x, str) for x in m):
+                    cat = "".join(m)
+                else:
+                    continue
+            else:
+                parts = m.split()
+                if len(parts) != 2:
+                    continue
+                cat = "".join(parts)
             if (cat in self.stems) and (self.counts.get(cat, 0) >= self.min_hits):
                 risky.append(i)
-        return risky
 
     def propose(self, merges: List[str]) -> List[int]:
         """
@@ -451,7 +469,7 @@ class WarmupAdapter:
             self.model_name, dtype=torch.bfloat16).to(self.device)
         lcfg = LoraConfig(
             r=self.lora_r, lora_alpha=self.lora_alpha, lora_dropout=self.lora_dropout,
-            target_modules=["Wqkv", "out_proj", "fc_in", "fc_out"]
+            target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
         )
         model = get_peft_model(model, lcfg)
         model.train()
@@ -463,7 +481,7 @@ class WarmupAdapter:
                 break
             if not t:
                 continue
-            batch = tok(t, return_tensors="pt", truncation=True, max_length=512).to(model.device)
+            batch = tok(t, return_tensors="pt", truncation=True, max_length=256).to(model.device)
             out = model(**batch, labels=batch["input_ids"])
             out.loss.backward()
             opt.step()
@@ -575,7 +593,7 @@ class JointScore(ScoreStrategy):
         ppl = eval_ppl(model, tok, self.u_dev_texts)
         tpc = tokens_per_char(tok, self.u_dev_texts)
 
-        # concept_scores returns an array; reduce to a scalar (mean)
+        # drift_score returns an array; reduce to a scalar (mean)
         _drift_arr = eval_drift(model, tok, self.neutrals, self.v, layer=self.drift_layer)
         drift = float(np.mean(_drift_arr)) if len(_drift_arr) else 0.0
 
@@ -770,6 +788,10 @@ def main():
     base_tok = AutoTokenizer.from_pretrained(args.base_tokenizer, use_fast=True)
     if not isinstance(base_tok, PreTrainedTokenizerFast):
         raise ValueError("Need a fast BPE tokenizer.")
+    # ensure pad token for tokenization with padding
+    if base_tok.pad_token_id is None:
+        base_tok.pad_token = base_tok.eos_token or base_tok.unk_token
+    base_tok.padding_side = "right"
     base_model = AutoModelForCausalLM.from_pretrained(model_name).to("cuda").eval()
     ppl0 = eval_ppl(base_model, base_tok, u_dev_texts)
     tpc0 = tokens_per_char(base_tok, u_dev_texts)
