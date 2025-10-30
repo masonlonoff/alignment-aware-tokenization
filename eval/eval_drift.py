@@ -41,7 +41,7 @@ def _read_texts(path: str, key="text") -> List[str]:
 
 
 @torch.no_grad()
-def concept_scores(model: AutoModel, tok, texts: List[str], v: np.ndarray, layer: int) -> np.ndarray:
+def drift_score(model: AutoModel, tok, texts: List[str], v: np.ndarray, layer: int) -> np.ndarray:
     v = torch.tensor(v, dtype=torch.float32, device=model.device).reshape(-1)
     out = []
     for t in texts:
@@ -73,8 +73,8 @@ def main():
     H = _read_texts(cfg["data"]["anchors"])
 
     layer = cfg["drift"]["layer"]
-    sN = concept_scores(model, tok, N, v, layer)
-    sH = concept_scores(model, tok, H, v, layer)
+    sN = drift_score(model, tok, N, v, layer)
+    sH = drift_score(model, tok, H, v, layer)
 
     np.save(os.path.join(args.out_dir, "drift_neutral.npy"), sN)
     np.save(os.path.join(args.out_dir, "drift_hazard.npy"), sH)
