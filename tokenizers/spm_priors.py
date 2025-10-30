@@ -113,6 +113,42 @@ def unique(seq: Iterable[str]) -> List[str]:
     return out
 
 
+def apply_hf_preset(args) -> None:
+    """
+    Mutates args with sensible defaults per family if not explicitly set.
+    Keeps user overrides if provided.
+    """
+    if args.hf_target == "none":
+        return
+
+    # Common SPM defaults for these families
+    if not args.normalization_rule_name or args.normalization_rule_name == "nmt":
+        args.normalization_rule_name = "nmt"
+    # Strong byte fallback is pragmatic for robustness
+    if not args.byte_fallback:
+        args.byte_fallback = "true"
+    # High coverage to keep rare chars
+    if not args.character_coverage:
+        args.character_coverage = 0.9995
+
+    # Special tokens presets are conservative—override via explicit flags if needed.
+    presets = {
+        "llama3":    {"bos": "<s>", "eos": "</s>", "pad": "", "extra": []},
+        "mistral7b": {"bos": "<s>", "eos": "</s>", "pad": "", "extra": []},
+        "qwen2_7b":  {"bos": "<s>", "eos": "</s>", "pad": "", "extra": []},
+    }
+    sp = presets.get(args.hf_target, {"bos": "", "eos": "", "pad": "", "extra": []})
+
+    # Only set if user didn’t supply explicit tokens
+    args.bos_token = args.bos_token or sp["bos"]
+    args.eos_token = args.eos_token or sp["eos"]
+    args.pad_token = args.pad_token or sp["pad"]
+
+    if args.user_defined_symbols == "" and args.addl_special == "":
+        # leave empty unless user passes addl_special
+        pass
+
+
 # ---------------------------------------------------------------------
 # Data model & strategies
 # ---------------------------------------------------------------------
@@ -414,61 +450,153 @@ class SPMHazardTrainer:
         uds = self.cfg.user_defined_symbols or []
         return ",".join(uds)
 
+    def _jsonl_to_txt(self, in_path: str, key: str = "text") -> str:
+        """If input looks like JSONL, convert to a temp TXT (one-per-line) for SPM."""
+        if not in_path.lower().endswith(".jsonl"):
+            return in_path
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        tmp_path = tmp.name
+        tmp.close()
+        xs = read_jsonl_texts(in_path, key=key)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for t in xs:
+                f.write(t + "\n")
+        return tmp_path
+
+    def _rescore_model(self, model_path: str, prior: PriorStrategy) -> int:
+        """
+        Post-EM hazard-aware rescore: open .model proto and replace each piece's
+        score with the prior-adjusted score. Returns number of pieces changed.
+        """
+        from sentencepiece import sentencepiece_model_pb2 as spmp
+        proto = spmp.ModelProto()
+        with open(model_path, "rb") as f:
+            proto.ParseFromString(f.read())
+
+        changed = 0
+        for p in proto.pieces:
+            if p.type in (
+                spmp.ModelProto.SentencePiece.Type.UNKNOWN,
+                spmp.ModelProto.SentencePiece.Type.CONTROL,
+                spmp.ModelProto.SentencePiece.Type.USER_DEFINED,
+                spmp.ModelProto.SentencePiece.Type.BYTE,
+            ):
+                continue
+            try:
+                new_score = float(prior.score(p.piece))
+            except Exception:
+                continue
+            if abs(new_score - p.score) > 1e-9:
+                p.score = new_score
+                changed += 1
+
+        with open(model_path, "wb") as f:
+            f.write(proto.SerializeToString())
+        return changed
+
     def train(self,
               anchors_path: str,
               neutrals_path: str,
               min_stem_len: int = 3,
               extra_seed: Sequence[str] | None = None) -> Tuple[str, str]:
         """
-        Run the hazard-aware Unigram training.
-
-        Args:
-            anchors_path: JSONL file with {"text": "..."} hazard anchors.
-            neutrals_path: JSONL file with {"text": "..."} neutral look-alikes.
-            min_stem_len: Minimum length for stems.
-            extra_seed: Optional extra pieces to include in seed (scored).
-
-        Returns:
-            (model_path, vocab_path) produced by SentencePiece.
+        Run hazard-aware Unigram training with:
+        A) try seeded priors (if supported),
+        B) else vanilla + post-EM hazard-aware rescore,
+        And auto-fallback from normalization 'nmt' -> 'identity' on Windows wheels lacking 'nmt'.
         """
-        # 1) Build hazard lexicon (we already baked it into the PriorStrategy's lex,
-        #    but we load here as well if needed for candidate filtering later).
-        anchors = read_jsonl_texts(anchors_path, key="text")
-        neutrals = read_jsonl_texts(neutrals_path, key="text")
-
-        # 2) Build seed (only hazard whole words and '▁'+word by default)
+        # Build seed
         seed_list = make_seed_sentencepieces(
             lex=self.prior.lex, prior=self.prior, extra_seed=extra_seed, include_hazard_whole_words=True
         )
-
-        # Apply any pre-filtering to seed, if desired:
         filtered_seed = [(p, s) for (p, s) in seed_list if self.candidate_filter.keep(p)]
-
-        # 3) Write seed file
         seed_path = f"{self.cfg.model_prefix}_seed.txt"
         write_seed_file(filtered_seed, seed_path)
 
-        # 4) Train SentencePiece with seed priors
-        args = [
-            f"--model_prefix={self.cfg.model_prefix}",
-            f"--model_type={self.cfg.model_type}",
-            f"--input={self.cfg.corpus}",
-            f"--vocab_size={self.cfg.vocab_size}",
-            f"--normalization_rule_name={self.cfg.normalization_rule_name}",
-            f"--input_sentence_size={self.cfg.input_sentence_size}",
-            f"--shuffle_input_sentence={'true' if self.cfg.shuffle_input_sentence else 'false'}",
-            f"--character_coverage={self.cfg.character_coverage}",
-            f"--seed_sentencepieces={seed_path}",
-            f"--hard_vocab_limit={'true' if self.cfg.hard_vocab_limit else 'false'}",
-            f"--byte_fallback={'true' if self.cfg.byte_fallback else 'false'}",
-        ]
+        # Convert JSONL to TXT for SPM if needed
+        input_path = self._jsonl_to_txt(self.cfg.corpus)
+
+        # Build base kwargs (safer than a single cmd string on Windows)
+        base_kwargs = dict(
+            model_prefix=self.cfg.model_prefix,
+            model_type=self.cfg.model_type,
+            input=input_path,
+            vocab_size=int(self.cfg.vocab_size),
+            normalization_rule_name=self.cfg.normalization_rule_name or "nmt",
+            input_sentence_size=int(self.cfg.input_sentence_size),
+            shuffle_input_sentence=bool(self.cfg.shuffle_input_sentence),
+            character_coverage=float(self.cfg.character_coverage),
+            hard_vocab_limit=bool(self.cfg.hard_vocab_limit),
+            byte_fallback=bool(self.cfg.byte_fallback),
+        )
+        # user_defined_symbols must be a comma-separated string if present
         uds = self._format_user_defined()
         if uds:
-            args.append(f"--user_defined_symbols={uds}")
+            base_kwargs["user_defined_symbols"] = uds
 
-        spm.SentencePieceTrainer.Train(" ".join(args))
+        def _try_train(kwargs: dict) -> None:
+            """Try SPM Train with given kwargs, else raise."""
+            import copy
+            spm.SentencePieceTrainer.Train(**copy.deepcopy(kwargs))
 
-        # 5) Return model paths (standard outputs)
+        used_seeded = False
+
+        # ---- Attempt seeded path first ----
+        try:
+            seeded_kwargs = dict(base_kwargs)
+            seeded_kwargs["seed_sentencepieces"] = seed_path
+            _try_train(seeded_kwargs)
+            used_seeded = True
+            print("[spm_priors] Seeded training path used (seed_sentencepieces).")
+        except OSError as e:
+            msg = str(e)
+            if "unknown field name" in msg and "seed_sentencepieces" in msg:
+                print("[spm_priors] seed_sentencepieces unsupported; falling back to vanilla + hazard-rescore.")
+            elif "No precompiled charsmap is found" in msg:
+                # Fallback nmt -> identity for seeded path
+                print(
+                    "[spm_priors] 'nmt' charsmap missing; retrying seeded with normalization_rule_name='identity'...")
+                seeded_kwargs = dict(base_kwargs)
+                seeded_kwargs["seed_sentencepieces"] = seed_path
+                seeded_kwargs["normalization_rule_name"] = "identity"
+                try:
+                    _try_train(seeded_kwargs)
+                    used_seeded = True
+                    print("[spm_priors] Seeded training succeeded with normalization='identity'.")
+                except Exception as e2:
+                    print(
+                        f"[spm_priors] Seeded+identity failed ({type(e2).__name__}); will try vanilla + rescore.")
+            else:
+                print(
+                    f"[spm_priors] Seeded training failed ({type(e).__name__}: {msg[:160]}); will try vanilla + rescore.")
+        except Exception as e:
+            print(
+                f"[spm_priors] Seeded training failed ({type(e).__name__}: {str(e)[:160]}); will try vanilla + rescore.")
+
+        # ---- Vanilla + post-EM rescore if seeded not used ----
+        if not used_seeded:
+            try:
+                _try_train(base_kwargs)
+                print("[spm_priors] Trained vanilla SPM. Applying hazard-aware post-EM rescore...")
+            except OSError as e:
+                msg = str(e)
+                if "No precompiled charsmap is found" in msg:
+                    # Fallback nmt -> identity for vanilla path
+                    print(
+                        "[spm_priors] 'nmt' charsmap missing; retrying vanilla with normalization_rule_name='identity'...")
+                    vanilla_kwargs = dict(base_kwargs)
+                    vanilla_kwargs["normalization_rule_name"] = "identity"
+                    _try_train(vanilla_kwargs)
+                    print(
+                        "[spm_priors] Vanilla SPM succeeded with normalization='identity'. Applying hazard-aware post-EM rescore...")
+                else:
+                    raise
+
+            model_path = f"{self.cfg.model_prefix}.model"
+            changed = self._rescore_model(model_path, self.prior)
+            print(f"[spm_priors] Rescored {changed} pieces via hazard-aware priors.")
+
         model_path = f"{self.cfg.model_prefix}.model"
         vocab_path = f"{self.cfg.model_prefix}.vocab"
         return model_path, vocab_path
@@ -511,6 +639,18 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--drop_risky_substrings", action="store_true",
                    help="Pre-filter short substrings of hazard stems.")
     p.add_argument("--min_substring_len", type=int, default=2)
+    p.add_argument("--hf_target", type=str, default="none",
+                   choices=["none", "llama3", "mistral7b", "qwen2_7b"],
+                   help="Preset SPM settings + common special tokens for target family.")
+    # explicit special tokens (override presets if provided)
+    p.add_argument("--bos_token", type=str, default="")
+    p.add_argument("--eos_token", type=str, default="")
+    p.add_argument("--pad_token", type=str, default="")
+    p.add_argument("--addl_special", type=str, default="",
+                   help="Comma-separated extra special tokens to register.")
+    # optional export to HF fast tokenizer folder
+    p.add_argument("--export_hf_dir", type=str, default="",
+                   help="If set, writes a HF fast tokenizer folder from the trained SPM model.")
     # Extras
     p.add_argument("--extra_seed", type=str, default="",
                    help="Path to a text file with extra seed pieces (one per line).")
@@ -519,10 +659,14 @@ def build_cli() -> argparse.ArgumentParser:
 
 def main():
     args = build_cli().parse_args()
+    apply_hf_preset(args)
 
-    # Assemble config
-    uds = [s for s in args.user_defined_symbols.split(
-        ",") if s] if args.user_defined_symbols else None
+    # Build user_defined_symbols list from preset + explicit extras
+    ud_list = []
+    if args.addl_special:
+        ud_list.extend([s for s in args.addl_special.split(",") if s])
+    # SPM uses user_defined_symbols for arbitrary specials (not BOS/EOS). We still register extras here.
+    uds = [s for s in ud_list] if ud_list else None
     cfg = SPMConfig(
         model_prefix=args.model_prefix,
         vocab_size=args.vocab_size,
@@ -581,6 +725,36 @@ def main():
     print(f"[done] wrote SPM model: {model_path}")
     print(f"[done] wrote SPM vocab: {vocab_path}")
     print(f"[note] hazard-aware seed written to: {cfg.model_prefix}_seed.txt")
+
+    # Optional: export to a HF fast tokenizer folder with declared special tokens
+    if args.export_hf_dir:
+        os.makedirs(args.export_hf_dir, exist_ok=True)
+        # Write a minimal tokenizer.json via SentencePieceProcessor conversion
+        # We’ll rely on HF AutoTokenizer to read the .model directly and then save.
+        from transformers import AutoTokenizer
+
+        # HF can load SPM .model via PreTrainedTokenizerFast when wrapped in a folder.
+        # Create a stub folder with tokenizer.model and a config.json for special tokens.
+        spm_model_dst = os.path.join(args.export_hf_dir, "tokenizer.model")
+        # copy the .model
+        import shutil
+        shutil.copyfile(model_path, spm_model_dst)
+
+        # Build a minimal config with special tokens (HF reads this on save_pretrained)
+        tok = AutoTokenizer.from_pretrained(
+            args.export_hf_dir, use_fast=True, trust_remote_code=True)
+
+        if args.bos_token:
+            tok.add_special_tokens({"bos_token": args.bos_token})
+        if args.eos_token:
+            tok.add_special_tokens({"eos_token": args.eos_token})
+        if args.pad_token:
+            tok.add_special_tokens({"pad_token": args.pad_token})
+        if ud_list:
+            tok.add_special_tokens({"additional_special_tokens": ud_list})
+
+        tok.save_pretrained(args.export_hf_dir)
+        print(f"[export] Wrote HF fast tokenizer to: {args.export_hf_dir}")
 
 
 if __name__ == "__main__":
