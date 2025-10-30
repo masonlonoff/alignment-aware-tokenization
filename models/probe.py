@@ -97,7 +97,7 @@ def main(args):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     model_name = cfg["model_name"]
-    model_kwargs = {"torch_dtype": dtype}
+    model_kwargs = {"dtype": dtype}
     if user_attn_impl in ("sdpa", "eager"):  # optional override
         model_kwargs["attn_implementation"] = user_attn_impl
 

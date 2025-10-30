@@ -62,7 +62,7 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     tok = AutoTokenizer.from_pretrained(cfg["model_name"])
     model = AutoModel.from_pretrained(
-        cfg["model_name"], torch_dtype=torch.bfloat16).to("cuda").eval()
+        cfg["model_name"], dtype=torch.bfloat16).to("cuda").eval()
 
     v = np.load(args.probe, allow_pickle=True)
     v = v.reshape(-1)

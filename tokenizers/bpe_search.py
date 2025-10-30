@@ -448,7 +448,7 @@ class WarmupAdapter:
             A PEFT-wrapped AutoModelForCausalLM in eval mode.
         """
         model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, torch_dtype=torch.bfloat16).to(self.device)
+            self.model_name, dtype=torch.bfloat16).to(self.device)
         lcfg = LoraConfig(
             r=self.lora_r, lora_alpha=self.lora_alpha, lora_dropout=self.lora_dropout,
             target_modules=["Wqkv", "out_proj", "fc_in", "fc_out"]

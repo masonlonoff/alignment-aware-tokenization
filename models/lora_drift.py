@@ -194,7 +194,7 @@ def main(args):
     _ensure_padding(tok)
 
     model = AutoModelForCausalLM.from_pretrained(
-        cfg["model_name"], torch_dtype=dtype).to(device).train()
+        cfg["model_name"], dtype=dtype).to(device).train()
 
     cfg_targets = cfg.get("lora", {}).get("target_modules")
     targets = cfg_targets if cfg_targets else _guess_targets(cfg["model_name"], model)

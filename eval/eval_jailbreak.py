@@ -133,7 +133,7 @@ def main():
     set_seed(args.seed)
     tok = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.bfloat16).to("cuda").eval()
+        args.model_name, dtype=torch.bfloat16).to("cuda").eval()
 
     v = np.load(args.probe, allow_pickle=True)
     if v.ndim > 1:
