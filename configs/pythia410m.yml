@@ -11,7 +11,7 @@ train:
   steps: 2000
   warmup_steps: 100
 drift:
-  lambda: 0.5
+  lambda: 0.0
   margin: 0.2
   layer: 10
 data:
