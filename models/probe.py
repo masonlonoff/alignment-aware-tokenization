@@ -80,7 +80,7 @@ def main(args):
     user_precision = cfg.get("precision", "")
     user_attn_impl = getattr(cfg, "attn_impl", None) or cfg.get("attn_impl", None)  # optional
     batch = int(getattr(args, "batch", 0) or 8)          # safe default for 4GB
-    max_len = int(getattr(args, "max_len", 0) or 256)    # 256 tokens is lighter
+    max_len = int(getattr(args, "max_len", 0) or 128)    # 128 tokens is much lighter
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = pick_dtype(user_precision, device)
@@ -96,13 +96,13 @@ def main(args):
         # optional env hint for fragmentation
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    model_name = cfg["model_name"]
+    model_name = cfg.get("tokenizer_name", cfg["model_name"])
     model_kwargs = {"dtype": dtype}
     if user_attn_impl in ("sdpa", "eager"):  # optional override
         model_kwargs["attn_implementation"] = user_attn_impl
 
     model = AutoModel.from_pretrained(model_name, **model_kwargs).to(device).eval()
-    tok = AutoTokenizer.from_pretrained(model_name)
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     ensure_padding(tok)
 
     H = load_texts(cfg["data"]["anchors"])
@@ -152,5 +152,5 @@ if __name__ == "__main__":
     p.add_argument("--save", required=True)
     p.add_argument("--batch", type=int, default=8,
                    help="encode batch size (defaults to 8 for 4GB GPUs)")
-    p.add_argument("--max_len", type=int, default=256, help="encode max_length (defaults to 128)")
+    p.add_argument("--max_len", type=int, default=128, help="encode max_length (defaults to 128)")
     main(p.parse_args())
