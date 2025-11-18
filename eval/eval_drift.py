@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+# eval/eval_drift.py
 """
 Drift evaluator (full):
 - Computes per-text concept logits for Hazard (H) and Neutral (N).
@@ -41,14 +40,17 @@ def _read_texts(path: str, key="text") -> List[str]:
 
 
 @torch.no_grad()
-def drift_score(model: AutoModel, tok, texts: List[str], v: np.ndarray, layer: int) -> np.ndarray:
-    v = torch.tensor(v, dtype=torch.float32, device=model.device).reshape(-1)
-    out = []
+def drift_score(model, tok, texts, v: np.ndarray, layer: int) -> np.ndarray:
+    # make sure v is a flat float32 tensor on the right device
+    v_t = torch.as_tensor(v, dtype=torch.float32, device=model.device).reshape(-1)
+    scores = []
     for t in texts:
         ids = tok(t, return_tensors="pt", truncation=True, max_length=256).to(model.device)
-        h = model(**ids, output_hidden_states=True).hidden_states[layer][0].mean(0)
-        out.append(torch.dot(h, v).item())
-    return np.array(out, dtype=np.float32)
+        out = model(**ids, output_hidden_states=True)
+        h = out.hidden_states[layer][0]              # [T, H]
+        h_mean = h.mean(dim=0).to(torch.float32)     # cast to float32
+        scores.append(torch.dot(h_mean, v_t).item())
+    return np.array(scores, dtype=np.float32)
 
 
 def main():
@@ -60,9 +62,10 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     cfg = yaml.safe_load(open(args.config))
-    tok = AutoTokenizer.from_pretrained(cfg["model_name"])
+    tok_name = cfg.get("tokenizer_name", cfg["model_name"])
+    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
     model = AutoModel.from_pretrained(
-        cfg["model_name"], dtype=torch.bfloat16).to("cuda").eval()
+        tok_name, torch_dtype=torch.bfloat16).to("cuda").eval()
 
     v = np.load(args.probe, allow_pickle=True)
     v = v.reshape(-1)
