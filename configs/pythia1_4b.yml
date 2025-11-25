@@ -5,7 +5,7 @@ lora:
   r: 16
   alpha: 32
   dropout: 0.05
-  target_modules: ["Wqkv", "out_proj", "fc_in", "fc_out"]
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
 train:
   lr: 2.0e-4
   batch_size: 32
