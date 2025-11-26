@@ -1,21 +1,22 @@
 # eval/eval_perplexity.py
 import argparse
 import glob
+import json
 import math
 import os
-import json
-import yaml
-import torch
+from typing import Iterable, List, Optional
+
 import numpy as np
-from typing import Iterable, List
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import yaml
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils.seeding import set_global_seed, log_run_meta, tokenizer_hash
 
 
 def _ensure_pad(tok):
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token or tok.unk_token
-    tok.padding_side = "right"
+    tok.padding_side = "right"  # right padding is fine for PPL
 
 
 def _iter_jsonl(path: str) -> Iterable[dict]:
@@ -24,114 +25,152 @@ def _iter_jsonl(path: str) -> Iterable[dict]:
             if not ln.strip():
                 continue
             try:
-                j = json.loads(ln)
-                yield j
+                yield json.loads(ln)
             except Exception:
-                # treat raw line as {"text": line}
                 yield {"text": ln.strip()}
 
 
+def _extract_text(j: dict) -> Optional[str]:
+    cand_keys = ["text", "prompt", "instruction", "question", "content", "inputs", "input"]
+    for k in cand_keys:
+        v = j.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    for v in j.values():
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
 def _load_texts_local(spec: str) -> List[str]:
-    # file
     if os.path.isfile(spec):
-        return [ex.get("text") or ex.get("prompt") or ex.get("instruction") or ex.get("question")
-                for ex in _iter_jsonl(spec)]
-    # dir
+        return [t for t in (_extract_text(ex) for ex in _iter_jsonl(spec)) if t]
     if os.path.isdir(spec):
         preferred = os.path.join(spec, "u_dev.jsonl")
         files = [preferred] if os.path.isfile(preferred) else sorted(
-            glob.glob(os.path.join(spec, "*.jsonl")))
-        out = []
+            glob.glob(os.path.join(spec, "*.jsonl"))
+        )
+        out: List[str] = []
         for fp in files:
-            out.extend([ex.get("text") or ex.get("prompt") or ex.get("instruction") or ex.get("question")
-                        for ex in _iter_jsonl(fp)])
+            out.extend([t for t in (_extract_text(ex) for ex in _iter_jsonl(fp)) if t])
         return out
-    # glob
     if any(ch in spec for ch in "*?[]"):
-        out = []
+        out: List[str] = []
         for fp in sorted(glob.glob(spec)):
-            out.extend([ex.get("text") or ex.get("prompt") or ex.get("instruction") or ex.get("question")
-                        for ex in _iter_jsonl(fp)])
+            out.extend([t for t in (_extract_text(ex) for ex in _iter_jsonl(fp)) if t])
         return out
     return []
 
 
-def _load_u_dev(spec: str, sample_n: int, seed: int) -> List[str]:
-    # try local first
-    local = _load_texts_local(spec)
-    local = [t for t in local if isinstance(t, str) and t.strip()]
-    if local:
-        rng = np.random.RandomState(seed)
-        idx = rng.permutation(len(local))[: min(sample_n, len(local))]
-        return [local[i] for i in idx]
-
-    # HF dataset id; try as HF repo, else "json" builder if looks like file/glob
-    try:
-        ds = load_dataset(spec, split="train")
-    except Exception:
-        if spec.lower().endswith((".jsonl", ".json")):
-            ds = load_dataset("json", data_files=spec, split="train")
-        else:
-            raise
-    ds = ds.shuffle(seed=seed)
-    ds = ds.select(range(min(sample_n, len(ds))))
-    # Prefer common text fields
-    cand_keys = ["text", "prompt", "instruction", "question", "content", "inputs", "input"]
-
-    def get_text(ex):
-        for k in cand_keys:
-            v = ex.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-        return None
-    return [t for t in (get_text(x) for x in ds) if isinstance(t, str) and t.strip()]
+def _sample_texts(texts: List[str], sample_n: int, seed: int) -> List[str]:
+    if not texts or sample_n is None or sample_n <= 0 or sample_n >= len(texts):
+        return texts
+    rng = np.random.RandomState(seed)
+    idx = rng.permutation(len(texts))[:sample_n]
+    return [texts[i] for i in idx]
 
 
 @torch.no_grad()
-def perplexity(model, tok, texts: List[str], batch_size: int = 2, max_length: int = 128) -> float:
+def perplexity(model, tok, texts: List[str], batch_size: int = 8, max_length: int = 256) -> float:
     _ensure_pad(tok)
     device = model.device
     total_nll = 0.0
     total_tokens = 0
+    try:
+        model.config.use_cache = False  # more stable loss with full context
+    except Exception:
+        pass
+
     for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
+        batch = texts[i:i + batch_size]
         enc = tok(batch, return_tensors="pt", truncation=True, padding=True, max_length=max_length)
         enc = {k: v.to(device) for k, v in enc.items()}
-        # labels: ignore pad tokens to avoid counting them
         labels = enc["input_ids"].clone()
         labels[enc["attention_mask"] == 0] = -100
         out = model(**enc, labels=labels)
-        # out.loss is mean CE over non -100; recover token sum:
-        # nll_batch = loss * (# of non-ignored tokens)
-        non_ignored = (labels != -100).sum().item()
-        total_nll += out.loss.item() * max(non_ignored, 1)
+        non_ignored = int((labels != -100).sum().item())
+        total_nll += float(out.loss.item()) * max(non_ignored, 1)
         total_tokens += non_ignored
+
     if total_tokens == 0:
         return float("inf")
     return math.exp(total_nll / total_tokens)
 
 
+def _pick_attn_impl() -> str:
+    # Avoid FlashAttn2 requirement
+    return "sdpa" if torch.cuda.is_available() else "eager"
+
+
+def _pick_dtype() -> torch.dtype:
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+
 def main(args):
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
-    model_name = cfg["model_name"]
-    # load data (HF id OR local file/dir/glob)
-    u_spec = cfg["data"]["unlabeled_stream"]
-    sample_n = int(cfg["eval"]["u_dev_sample"])
-    u_dev_texts = _load_u_dev(u_spec, sample_n=sample_n, seed=9172)
-    if not u_dev_texts:
-        raise FileNotFoundError(f"No texts found for spec: {u_spec}")
 
-    # model/tokenizer + minor safety knobs
+    model_name = cfg.get("model_name")
+    tokenizer_name = cfg.get("tokenizer_name", model_name)
+    data_spec = cfg["data"]["unlabeled_stream"]
+
+    seed = int(cfg.get("seed", 9172))
+    bs = int(args.batch_size or cfg.get("eval", {}).get("batch_size", 8))
+    max_len = int(args.max_length or cfg.get("eval", {}).get("max_length", 256))
+    sample_n = int(args.sample_n or cfg.get("eval", {}).get("u_dev_sample", 1024))
+
+    # seeding
+    set_global_seed(seed)
+
+    # data
+    texts = _load_texts_local(data_spec)
+    if not texts:
+        raise FileNotFoundError(f"No texts found for spec: {data_spec}")
+    texts = _sample_texts(texts, sample_n=sample_n, seed=seed)
+
+    # model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device).eval()
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    attn_impl = _pick_attn_impl()
+    dtype = _pick_dtype()
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     _ensure_pad(tok)
 
-    ppl = perplexity(model, tok, u_dev_texts, batch_size=8, max_length=512)
-    print(f"Perplexity: {ppl:.2f}")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        attn_implementation=attn_impl,   # prevents FlashAttn2 import error
+        dtype=dtype,                     # use `dtype`, not deprecated `torch_dtype`
+        low_cpu_mem_usage=True,
+    ).to(device).eval()
+
+    ppl = perplexity(model, tok, texts, batch_size=bs, max_length=max_len)
+    print(f"Perplexity: {ppl:.3f}")
+
+    # from tokenizers.bpe_search import tokens_per_char
+    # tpc = tokens_per_char(tok, texts)
+    # print(f"TPC: {tpc:.5f}")
+
+    out_dir = cfg.get("out_dir", None)
+    if out_dir:
+        extras = {
+            "num_texts": len(texts),
+            "batch_size": bs,
+            "max_length": max_len,
+            "attn_impl": attn_impl,
+            "dtype": str(dtype).replace("torch.", ""),
+            "perplexity": ppl,
+            "tokenizer_hash": tokenizer_hash(tokenizer_name),
+        }
+        log_run_meta(out_dir, cfg, extras=extras)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--max_length", type=int, default=256)
+    p.add_argument("--sample_n", type=int, default=1024)
     main(p.parse_args())
