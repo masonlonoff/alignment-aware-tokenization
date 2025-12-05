@@ -17,10 +17,10 @@ model quality. It follows the plan in the proposal:
         J = ppl/ppl0 + α * drift/drift0 + β * tpc/tpc0
 
      where:
-       - ppl  = perplexity on held-out U_dev
+       - ppl   = perplexity on held-out U_dev
        - drift = neutral-context concept logit (lower is better)
-       - tpc  = tokens per character (length/latency proxy)
-       - *_0  = baseline normalization constants
+       - tpc   = tokens per character (length/latency proxy)
+       - *_0   = baseline normalization constants
   4) Accept edits only if J improves; output a new HF tokenizer directory with
      edited `tokenizer.json` (same vocab + specials; merges changed).
 
@@ -30,34 +30,42 @@ Design patterns:
   - Encapsulation: TokenizerEditor (I/O), WarmupAdapter (LoRA warmup)
 
 Typical usage (CLI):
-  python -m tokenizers.bpe_search --base_tokenizer EleutherAI/pythia-410m \
+
+  python -m tokenizers.bpe_search \
+    --base_tokenizer EleutherAI/pythia-410m \
     --model_name EleutherAI/pythia-410m \
-    --anchors data/anchors.jsonl --neutrals data/neutral_lookalikes.jsonl \
-    --u_dev_dataset segyges/OpenWebText2 --u_dev_size 20000 \
-    --probe probes/v_layer.pt --rounds 5 --prune_k 30 \
+    --anchors data/anchors.jsonl \
+    --neutrals data/neutral_lookalikes.jsonl \
+    --u_dev_dataset data/unlabeled/u_dev.jsonl \
+    --u_dev_size 20000 \
+    --probe probes/v_layer.npy \
+    --rounds 5 \
+    --prune_k 30 \
     --out tokenizers/bpe_searched
 """
 
 from __future__ import annotations
+
 import argparse
+import glob
 import json
 import math
 import os
-import glob
 import random
-from re import search
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
-from typing import Iterable
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
-from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedTokenizerFast,
+)
 
 from eval.eval_perplexity import perplexity as eval_ppl
 from eval.eval_drift import drift_score as eval_drift
@@ -67,6 +75,7 @@ from models.embed_remap import EmbeddingRemapper
 # ----------------------------
 # Utilities
 # ----------------------------
+
 
 def set_seeds(seed: int = 9172):
     """
@@ -85,14 +94,14 @@ def read_jsonl_texts(path: str, key: str = "text", limit: int | None = None) -> 
     Read newline-delimited JSON with a given `key` (default: "text").
 
     Args:
-        path: File path to JSONL.
-        key:  Field name to pull the text from.
+        path:  File path to JSONL.
+        key:   Field name to pull the text from.
         limit: Optional maximum number of lines to read.
 
     Returns:
         List of non-empty, stripped strings.
     """
-    out = []
+    out: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if limit is not None and i >= limit:
@@ -108,13 +117,22 @@ def read_jsonl_texts(path: str, key: str = "text", limit: int | None = None) -> 
 
 
 def _iter_jsonl_file(path: str) -> Iterable[str]:
+    """
+    Yield text-like fields from a JSONL file.
+    Tries common keys; falls back to the raw line on parse failures.
+    """
     with open(path, "r", encoding="utf-8") as f:
         for ln in f:
             if not ln.strip():
                 continue
             try:
                 j = json.loads(ln)
-                t = j.get("text") or j.get("prompt") or j.get("instruction") or j.get("question")
+                t = (
+                    j.get("text")
+                    or j.get("prompt")
+                    or j.get("instruction")
+                    or j.get("question")
+                )
             except Exception:
                 t = ln
             if isinstance(t, str) and t.strip():
@@ -122,51 +140,62 @@ def _iter_jsonl_file(path: str) -> Iterable[str]:
 
 
 def _load_local_texts(spec: str) -> list[str]:
-    # spec can be a file, dir, or glob
+    """
+    Load texts from a local JSONL source.
+
+    `spec` can be:
+      - a single JSON/JSONL file path
+      - a directory (reads u_dev.jsonl if present, else all *.jsonl)
+      - a glob pattern for JSONL files
+    """
+    # File
     if os.path.isfile(spec):
         return list(_iter_jsonl_file(spec))
+
+    # Directory
     if os.path.isdir(spec):
-        # prefer u_dev.jsonl if present; else take all *.jsonl
         cand = os.path.join(spec, "u_dev.jsonl")
-        files = [cand] if os.path.isfile(cand) else sorted(glob.glob(os.path.join(spec, "*.jsonl")))
-        out = []
+        files = (
+            [cand]
+            if os.path.isfile(cand)
+            else sorted(glob.glob(os.path.join(spec, "*.jsonl")))
+        )
+        out: list[str] = []
         for fp in files:
             out.extend(_iter_jsonl_file(fp))
         return out
-    # glob pattern
+
+    # Glob pattern
     if any(ch in spec for ch in "*?[]"):
-        out = []
+        out: list[str] = []
         for fp in sorted(glob.glob(spec)):
             out.extend(_iter_jsonl_file(fp))
         return out
+
     return []
 
 
-def sample_u_dev(dataset_or_path: str, n: int, seed: int) -> list[str]:
+def sample_u_dev(path_or_glob: str, n: int, seed: int) -> list[str]:
     """
-    Accepts either a HF dataset id OR a local file/dir/glob.
-    - HF path → load_dataset(id, split='train')
-    - Local   → read jsonl(s)
-    """
-    # Try local first
-    local = _load_local_texts(dataset_or_path)
-    if local:
-        rng = np.random.RandomState(seed)
-        idx = rng.permutation(len(local))[: min(n, len(local))]
-        return [local[i] for i in idx]
+    Sample a dev slice from local JSONL text files only.
 
-    # Fall back to HF dataset id
-    try:
-        ds = load_dataset(dataset_or_path, split="train")
-    except Exception:
-        # As a last resort: JSON builder if the string looks like a json/jsonl file
-        if dataset_or_path.lower().endswith((".jsonl", ".json")):
-            ds = load_dataset("json", data_files=dataset_or_path, split="train")
-        else:
-            raise
-    ds = ds.shuffle(seed=seed)
-    n = min(n, len(ds))
-    return [x.get("text", "") for x in ds.select(range(n))]
+    `path_or_glob` can be:
+      - file path
+      - directory
+      - glob pattern
+
+    Raises:
+        FileNotFoundError if no texts are found.
+    """
+    local = _load_local_texts(path_or_glob)
+    if not local:
+        raise FileNotFoundError(
+            f"No local texts found for u_dev at '{path_or_glob}'. "
+            "Expected a JSONL file, directory, or glob."
+        )
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(local))[: min(n, len(local))]
+    return [local[i] for i in idx]
 
 
 def tokens_per_char(tok: PreTrainedTokenizerFast, texts: List[str]) -> float:
@@ -180,7 +209,8 @@ def tokens_per_char(tok: PreTrainedTokenizerFast, texts: List[str]) -> float:
     Returns:
         Mean tokens per character (float).
     """
-    total_toks = total_chars = 0
+    total_toks = 0
+    total_chars = 0
     for t in texts:
         if not t:
             continue
@@ -215,7 +245,9 @@ def extract_hazard_stems(anchors: List[str], min_len: int = 3) -> List[str]:
     return sorted(stems)
 
 
-def benign_counts_by_stem(neutrals: List[str], stems: List[str], max_hits_per_stem: int = 200) -> Dict[str, int]:
+def benign_counts_by_stem(
+    neutrals: List[str], stems: List[str], max_hits_per_stem: int = 200
+) -> Dict[str, int]:
     """
     Count how often each hazard stem appears as a substring inside neutral texts.
 
@@ -243,6 +275,7 @@ def benign_counts_by_stem(neutrals: List[str], stems: List[str], max_hits_per_st
 # ----------------------------
 # Tokenizer editor
 # ----------------------------
+
 
 class TokenizerEditor:
     """
@@ -273,10 +306,10 @@ class TokenizerEditor:
 
         # Normalize to list[str] like "a b", and remember original format
         if isinstance(merges_raw[0], list):
-            self._merges_format = "pairs"             # e.g., [["a","b"], ["c","d"], ...]
+            self._merges_format = "pairs"  # e.g., [["a","b"], ["c","d"], ...]
             self.baseline_merges = [" ".join(p) for p in merges_raw]
         elif isinstance(merges_raw[0], str):
-            self._merges_format = "strings"           # e.g., ["a b", "c d", ...]
+            self._merges_format = "strings"  # e.g., ["a b", "c d", ...]
             self.baseline_merges = list(merges_raw)
         else:
             raise ValueError("Unsupported merges entry type.")
@@ -302,10 +335,12 @@ class TokenizerEditor:
         # Replace merges inside tokenizer.json
         obj = json.loads(self.tokjson_path.read_text(encoding="utf-8"))
         if getattr(self, "_merges_format", "strings") == "pairs":
-            obj["model"]["merges"] = [m.split(" ") for m in merges]   # back to [["a","b"], ...]
+            obj["model"]["merges"] = [m.split(" ") for m in merges]  # back to [["a","b"], ...]
         else:
-            obj["model"]["merges"] = merges                           # keep ["a b", ...]
-        (out_dir / "tokenizer.json").write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            obj["model"]["merges"] = merges  # keep ["a b", ...]
+        (out_dir / "tokenizer.json").write_text(
+            json.dumps(obj, ensure_ascii=False), encoding="utf-8"
+        )
 
         # Load fast tokenizer from edited file
         tok = PreTrainedTokenizerFast(tokenizer_file=str(out_dir / "tokenizer.json"))
@@ -319,11 +354,12 @@ class TokenizerEditor:
             pass
         return tok
 
+    @staticmethod
     def save_and_optionally_remap(
         base_model_dir: str,
         edited_tok_dir: Path,
         remap_out: str | None,
-        tie_lm_head: bool = True
+        tie_lm_head: bool = True,
     ) -> str:
         """
         If remap_out is provided (non-empty), run EmbeddingRemapper to create a stable
@@ -346,6 +382,7 @@ class TokenizerEditor:
 # ----------------------------
 # Candidate generation (Strategy)
 # ----------------------------
+
 
 class CandidateGenerator:
     """
@@ -376,7 +413,13 @@ class RiskyMergePruner(CandidateGenerator):
         prune_k:         Max risky merges to prune in a round.
     """
 
-    def __init__(self, stems: List[str], benign_counts: Dict[str, int], min_benign_hits: int, prune_k: int):
+    def __init__(
+        self,
+        stems: List[str],
+        benign_counts: Dict[str, int],
+        min_benign_hits: int,
+        prune_k: int,
+    ):
         self.stems = set(stems)
         self.counts = dict(benign_counts)
         self.min_hits = int(min_benign_hits)
@@ -392,11 +435,15 @@ class RiskyMergePruner(CandidateGenerator):
         Returns:
             List of integer indices into `merges`.
         """
-        risky = []
+        risky: List[int] = []
         for i, m in enumerate(merges):
             if not isinstance(m, str):
                 # handle accidental pair form
-                if isinstance(m, (list, tuple)) and len(m) == 2 and all(isinstance(x, str) for x in m):
+                if (
+                    isinstance(m, (list, tuple))
+                    and len(m) == 2
+                    and all(isinstance(x, str) for x in m)
+                ):
                     cat = "".join(m)
                 else:
                     continue
@@ -407,6 +454,7 @@ class RiskyMergePruner(CandidateGenerator):
                 cat = "".join(parts)
             if (cat in self.stems) and (self.counts.get(cat, 0) >= self.min_hits):
                 risky.append(i)
+        return risky
 
     def propose(self, merges: List[str]) -> List[int]:
         """
@@ -429,6 +477,7 @@ class RiskyMergePruner(CandidateGenerator):
 # Warmup adapter (LoRA)
 # ----------------------------
 
+
 class WarmupAdapter:
     """
     Perform a short LoRA warmup to let the LM adapt to the new tokenizer
@@ -444,8 +493,16 @@ class WarmupAdapter:
         device:       Torch device (default "cuda").
     """
 
-    def __init__(self, model_name: str, steps: int = 150, lr: float = 2e-4,
-                 lora_r: int = 8, lora_alpha: int = 16, lora_dropout: float = 0.05, device: str = "cuda"):
+    def __init__(
+        self,
+        model_name: str,
+        steps: int = 150,
+        lr: float = 2e-4,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        device: str = "cuda",
+    ):
         self.model_name = model_name
         self.steps = steps
         self.lr = lr
@@ -466,10 +523,18 @@ class WarmupAdapter:
             A PEFT-wrapped AutoModelForCausalLM in eval mode.
         """
         model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, dtype=torch.bfloat16).to(self.device)
+            self.model_name, dtype=torch.bfloat16
+        ).to(self.device)
         lcfg = LoraConfig(
-            r=self.lora_r, lora_alpha=self.lora_alpha, lora_dropout=self.lora_dropout,
-            target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+            r=self.lora_r,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.lora_dropout,
+            target_modules=[
+                "query_key_value",
+                "dense",
+                "dense_h_to_4h",
+                "dense_4h_to_h",
+            ],
         )
         model = get_peft_model(model, lcfg)
         model.train()
@@ -481,7 +546,9 @@ class WarmupAdapter:
                 break
             if not t:
                 continue
-            batch = tok(t, return_tensors="pt", truncation=True, max_length=256).to(model.device)
+            batch = tok(
+                t, return_tensors="pt", truncation=True, max_length=256
+            ).to(model.device)
             out = model(**batch, labels=batch["input_ids"])
             out.loss.backward()
             opt.step()
@@ -495,6 +562,7 @@ class WarmupAdapter:
 # Scoring (Strategy)
 # ----------------------------
 
+
 @dataclass
 class ScoreResult:
     """
@@ -506,6 +574,7 @@ class ScoreResult:
         drift: Neutral drift score (mean concept logit).
         tpc:   Tokens per character on U_dev.
     """
+
     J: float
     ppl: float
     drift: float
@@ -543,9 +612,20 @@ class JointScore(ScoreStrategy):
         warmup_steps: LoRA warmup steps per candidate.
     """
 
-    def __init__(self, model_name: str, u_dev_texts: List[str], neutrals: List[str], v_path: str,
-                 alpha: float, beta: float, ppl0: float, drift0: float, tpc0: float,
-                 drift_layer: int = 10, warmup_steps: int = 150):
+    def __init__(
+        self,
+        model_name: str,
+        u_dev_texts: List[str],
+        neutrals: List[str],
+        v_path: str,
+        alpha: float,
+        beta: float,
+        ppl0: float,
+        drift0: float,
+        tpc0: float,
+        drift_layer: int = 10,
+        warmup_steps: int = 150,
+    ):
         self.model_name = model_name
         self.u_dev_texts = u_dev_texts
         self.neutrals = neutrals
@@ -594,16 +674,21 @@ class JointScore(ScoreStrategy):
         tpc = tokens_per_char(tok, self.u_dev_texts)
 
         # drift_score returns an array; reduce to a scalar (mean)
-        _drift_arr = eval_drift(model, tok, self.neutrals, self.v, layer=self.drift_layer)
+        _drift_arr = eval_drift(
+            model, tok, self.neutrals, self.v, layer=self.drift_layer
+        )
         drift = float(np.mean(_drift_arr)) if len(_drift_arr) else 0.0
 
-        J = (ppl / self.ppl0) + self.alpha * (drift / self.drift0) + self.beta * (tpc / self.tpc0)
+        J = (ppl / self.ppl0) + self.alpha * (drift / self.drift0) + self.beta * (
+            tpc / self.tpc0
+        )
         return ScoreResult(float(J), float(ppl), float(drift), float(tpc))
 
 
 # ----------------------------
 # Search controller (Template Method)
 # ----------------------------
+
 
 class BPESearch:
     """
@@ -619,11 +704,24 @@ class BPESearch:
         candidate_gen:     CandidateGenerator instance (e.g., RiskyMergePruner).
         rounds:            Number of search rounds.
         seed:              RNG seed.
+        remap_each_accept: Whether to remap embeddings after each accepted edit.
+        remap_out:         Base directory to store remapped bundles.
     """
 
-    def __init__(self, base_tokenizer_id: str, model_name: str, anchors: List[str], neutrals: List[str],
-                 u_dev_texts: List[str], score: ScoreStrategy, candidate_gen: CandidateGenerator,
-                 rounds: int, seed: int):
+    def __init__(
+        self,
+        base_tokenizer_id: str,
+        model_name: str,
+        anchors: List[str],
+        neutrals: List[str],
+        u_dev_texts: List[str],
+        score: ScoreStrategy,
+        candidate_gen: CandidateGenerator,
+        rounds: int,
+        seed: int,
+        remap_each_accept: bool = False,
+        remap_out: str = "",
+    ):
         set_seeds(seed)
         self.base_tokenizer_id = base_tokenizer_id
         self.model_name = model_name
@@ -633,10 +731,17 @@ class BPESearch:
         self.score = score
         self.candidate_gen = candidate_gen
         self.rounds = rounds
+        self.remap_each_accept = remap_each_accept
+        self.remap_out = remap_out
+
+        # logging history: round-by-round metrics
+        self.history: List[Dict] = []
 
         # Prepare editable baseline tokenizer dir
         self._tmpdir = Path(tempfile.mkdtemp())
-        self.base_tok = AutoTokenizer.from_pretrained(self.base_tokenizer_id, use_fast=True)
+        self.base_tok = AutoTokenizer.from_pretrained(
+            self.base_tokenizer_id, use_fast=True
+        )
         if not isinstance(self.base_tok, PreTrainedTokenizerFast):
             raise ValueError("Need a fast BPE tokenizer.")
         self.base_tok.save_pretrained(self._tmpdir)
@@ -645,6 +750,7 @@ class BPESearch:
         self.best_merges = list(self.editor.baseline_merges)
         self.best_tok = self.base_tok
         self.best_score: ScoreResult | None = None
+        self._accept_workdir: Path | None = None
 
     def _tok_from_merges(self, merges: List[str]) -> PreTrainedTokenizerFast:
         """
@@ -665,8 +771,21 @@ class BPESearch:
         """
         res = self.score.score(self.base_tok)
         self.best_score = res
+        self.history.append(
+            {
+                "round": 0,
+                "removed": 0,
+                "J": res.J,
+                "ppl": res.ppl,
+                "drift": res.drift,
+                "tpc": res.tpc,
+                "accepted": True,
+            }
+        )
         print(
-            f"[round 0] J={res.J:.4f} | ppl={res.ppl:.3f} | drift={res.drift:.5f} | tpc={res.tpc:.5f}")
+            f"[round 0] J={res.J:.4f} | ppl={res.ppl:.3f} | "
+            f"drift={res.drift:.5f} | tpc={res.tpc:.5f}"
+        )
 
     def search(self) -> Tuple[List[str], ScoreResult]:
         """
@@ -692,47 +811,73 @@ class BPESearch:
             # Score candidate
             cand_tok = self._tok_from_merges(new_merges)
             cand_res = self.score.score(cand_tok)
-            print(f"[round {r}] removed={len(remove_idx)} | J={cand_res.J:.4f} | "
-                  f"ppl={cand_res.ppl:.3f} | drift={cand_res.drift:.5f} | tpc={cand_res.tpc:.5f}")
+            print(
+                f"[round {r}] removed={len(remove_idx)} | "
+                f"J={cand_res.J:.4f} | ppl={cand_res.ppl:.3f} | "
+                f"drift={cand_res.drift:.5f} | tpc={cand_res.tpc:.5f}"
+            )
 
-            # Accept/reject
+            accepted = False
             if (self.best_score is None) or (cand_res.J < self.best_score.J):
-                print(
-                    f"  -> accepted (J ↓ {self.best_score.J:.4f} → {cand_res.J:.4f})"
-                    if self.best_score else "  -> accepted"
-                )
+                accepted = True
+                if self.best_score is not None:
+                    print(
+                        f"  -> accepted (J ↓ {self.best_score.J:.4f} → {cand_res.J:.4f})"
+                    )
+                else:
+                    print("  -> accepted")
+
                 merges = new_merges
                 self.best_merges = new_merges
                 self.best_score = cand_res
 
-                # --- NEW: persist accepted tokenizer and (optionally) remap embeddings ---
-                if getattr(self, "_accept_workdir", None) is None:
-                    self._accept_workdir = Path(tempfile.mkdtemp(prefix="bpe_accept_"))
-                accepted_tok_dir = self.editor.write_edited(
-                    self.best_merges, self._accept_workdir / f"tok_round_{r}")
+                # Persist accepted tokenizer to a workdir
+                if self._accept_workdir is None:
+                    self._accept_workdir = Path(
+                        tempfile.mkdtemp(prefix="bpe_accept_")
+                    )
+                accept_dir = self._accept_workdir / f"tok_round_{r}"
+                accept_tok = self.editor.write_edited(self.best_merges, accept_dir)
 
-                if getattr(self, "_remap_each_accept", False):
+                if self.remap_each_accept:
                     # Decide save target
-                    if hasattr(self, "_remap_out") and self._remap_out:
-                        save_target = os.path.join(self._remap_out, f"round_{r}")
-                    else:
-                        save_target = ""  # temp use; no persistent bundle
+                    save_target = (
+                        os.path.join(self.remap_out, f"round_{r}")
+                        if self.remap_out
+                        else None
+                    )
 
                     used_dir = TokenizerEditor.save_and_optionally_remap(
-                        base_model_dir=self.model_name,         # HF repo id or local model dir
-                        edited_tok_dir=Path(accepted_tok_dir),
+                        base_model_dir=self.model_name,
+                        edited_tok_dir=accept_dir,
                         remap_out=save_target,
                         tie_lm_head=True,
                     )
-                    # Reload tokenizer from the (remapped or edited) directory
-                    self.best_tok = AutoTokenizer.from_pretrained(used_dir, use_fast=True)
+                    self.best_tok = AutoTokenizer.from_pretrained(
+                        used_dir, use_fast=True
+                    )
                     print(
-                        f"    remap: embeddings {'done → ' + used_dir if save_target else 'skipped (temp)'}")
+                        f"    remap: embeddings "
+                        f"{'done → ' + used_dir if save_target else 'skipped (temp)'}"
+                    )
                 else:
-                    # If not remapping each round, still advance best_tok to the edited tokenizer
-                    self.best_tok = AutoTokenizer.from_pretrained(accepted_tok_dir, use_fast=True)
+                    # No remap: just keep the edited tokenizer
+                    self.best_tok = accept_tok
             else:
                 print("  -> rejected (no improvement)")
+
+            self.history.append(
+                {
+                    "round": r,
+                    "removed": len(remove_idx),
+                    "J": cand_res.J,
+                    "ppl": cand_res.ppl,
+                    "drift": cand_res.drift,
+                    "tpc": cand_res.tpc,
+                    "accepted": accepted,
+                }
+            )
+
         return self.best_merges, self.best_score  # type: ignore
 
 
@@ -740,38 +885,86 @@ class BPESearch:
 # CLI
 # ----------------------------
 
+
 def main():
     """
     Command-line entry point. See module docstring for a usage example.
     """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base_tokenizer", required=True,
-                    help="HF id for fast BPE tokenizer, e.g., EleutherAI/pythia-410m")
-    ap.add_argument("--model_name", default=None,
-                    help="LM id used for warmup/scoring; defaults to base_tokenizer")
-    ap.add_argument("--anchors", required=True, help="JSONL with {text: ...} hazard anchors")
-    ap.add_argument("--neutrals", required=True, help="JSONL with {text: ...} neutral look-alikes")
-    ap.add_argument("--u_dev_dataset", default="data/unlabeled/u_dev.jsonl",
-                    help="HF dataset for ppl/tpc dev slice")
-    ap.add_argument("--u_dev_size", type=int, default=20000, help="Sample size for dev slice")
-    ap.add_argument("--probe", required=True,
-                    help="Path to concept vector (npy or pt saved as npy)")
+    ap.add_argument(
+        "--base_tokenizer",
+        required=True,
+        help="HF id for fast BPE tokenizer, e.g., EleutherAI/pythia-410m",
+    )
+    ap.add_argument(
+        "--model_name",
+        default=None,
+        help="LM id used for warmup/scoring; defaults to base_tokenizer",
+    )
+    ap.add_argument(
+        "--anchors", required=True, help="JSONL with {text: ...} hazard anchors"
+    )
+    ap.add_argument(
+        "--neutrals", required=True, help="JSONL with {text: ...} neutral look-alikes"
+    )
+    ap.add_argument(
+        "--u_dev_dataset",
+        default="data/unlabeled/u_dev.jsonl",
+        help="Local JSONL file/dir/glob for unlabeled dev texts (no HF datasets).",
+    )
+    ap.add_argument(
+        "--u_dev_size", type=int, default=20000, help="Sample size for dev slice"
+    )
+    ap.add_argument(
+        "--probe",
+        required=True,
+        help="Path to concept vector (npy or pt saved as npy)",
+    )
     ap.add_argument("--rounds", type=int, default=5, help="Search rounds")
-    ap.add_argument("--prune_k", type=int, default=30, help="Max risky merges to prune per round")
-    ap.add_argument("--min_benign_hits", type=int, default=5,
-                    help="Min neutral occurrences to mark a stem risky")
-    ap.add_argument("--alpha", type=float, default=0.7, help="Weight for drift term in J")
-    ap.add_argument("--beta", type=float, default=0.1, help="Weight for tpc term in J")
-    ap.add_argument("--drift_layer", type=int, default=10, help="Layer index for drift projection")
-    ap.add_argument("--warmup_steps", type=int, default=150, help="LoRA warmup steps per candidate")
+    ap.add_argument(
+        "--prune_k", type=int, default=30, help="Max risky merges to prune per round"
+    )
+    ap.add_argument(
+        "--min_benign_hits",
+        type=int,
+        default=5,
+        help="Min neutral occurrences to mark a stem risky",
+    )
+    ap.add_argument(
+        "--alpha", type=float, default=0.7, help="Weight for drift term in J"
+    )
+    ap.add_argument(
+        "--beta", type=float, default=0.1, help="Weight for tpc term in J"
+    )
+    ap.add_argument(
+        "--drift_layer", type=int, default=10, help="Layer index for drift projection"
+    )
+    ap.add_argument(
+        "--warmup_steps", type=int, default=150, help="LoRA warmup steps per candidate"
+    )
     ap.add_argument("--seed", type=int, default=42, help="RNG seed")
     ap.add_argument("--max_h", type=int, default=1000, help="Max anchors to read")
     ap.add_argument("--max_n", type=int, default=2000, help="Max neutrals to read")
-    ap.add_argument("--out", required=True, help="Output dir for edited tokenizer (HF format)")
-    ap.add_argument("--remap_each_accept", action="store_true",
-                    help="If set, remap model embeddings after each accepted edit and use that tokenizer in subsequent rounds.")
-    ap.add_argument("--remap_out", type=str, default="",
-                    help="Directory to save remapped model+tokenizer when an edit is accepted. If empty, a temp dir is used.")
+    ap.add_argument(
+        "--out", required=True, help="Output dir for edited tokenizer (HF format)"
+    )
+    ap.add_argument(
+        "--remap_each_accept",
+        action="store_true",
+        help=(
+            "If set, remap model embeddings after each accepted edit and use that "
+            "tokenizer in subsequent rounds."
+        ),
+    )
+    ap.add_argument(
+        "--remap_out",
+        type=str,
+        default="",
+        help=(
+            "Directory to save remapped model+tokenizer when an edit is accepted. "
+            "If empty, a temp dir is used."
+        ),
+    )
     args = ap.parse_args()
 
     set_seeds(args.seed)
@@ -792,48 +985,98 @@ def main():
     if base_tok.pad_token_id is None:
         base_tok.pad_token = base_tok.eos_token or base_tok.unk_token
     base_tok.padding_side = "right"
+
     base_model = AutoModelForCausalLM.from_pretrained(model_name).to("cuda").eval()
     ppl0 = eval_ppl(base_model, base_tok, u_dev_texts)
     tpc0 = tokens_per_char(base_tok, u_dev_texts)
-    v = np.load(args.probe, allow_pickle=True) if args.probe.endswith(".npy") else (
-        np.load(args.probe + ".npy", allow_pickle=True) if os.path.exists(args.probe +
-                                                                          ".npy") else np.load(args.probe, allow_pickle=True)
-    )
+
+    # load concept vector
+    if args.probe.endswith(".npy"):
+        v = np.load(args.probe, allow_pickle=True)
+    elif os.path.exists(args.probe + ".npy"):
+        v = np.load(args.probe + ".npy", allow_pickle=True)
+    else:
+        v = np.load(args.probe, allow_pickle=True)
+
     _drift0_arr = eval_drift(base_model, base_tok, neutrals, v, layer=args.drift_layer)
     drift0 = float(np.mean(_drift0_arr)) if len(_drift0_arr) else 0.0
     drift0 = drift0 if abs(drift0) > 1e-12 else 1e-12  # avoid divide-by-zero later
-    print(f"[baseline norms] ppl0={ppl0:.3f} | tpc0={tpc0:.5f} | drift0={drift0:.5f}")
+    print(
+        f"[baseline norms] ppl0={ppl0:.3f} | tpc0={tpc0:.5f} | drift0={drift0:.5f}"
+    )
 
-    scorer = JointScore(model_name, u_dev_texts, neutrals, args.probe,
-                        alpha=args.alpha, beta=args.beta,
-                        ppl0=ppl0, drift0=drift0, tpc0=tpc0,
-                        drift_layer=args.drift_layer, warmup_steps=args.warmup_steps)
+    scorer = JointScore(
+        model_name,
+        u_dev_texts,
+        neutrals,
+        args.probe,
+        alpha=args.alpha,
+        beta=args.beta,
+        ppl0=ppl0,
+        drift0=drift0,
+        tpc0=tpc0,
+        drift_layer=args.drift_layer,
+        warmup_steps=args.warmup_steps,
+    )
     generator = RiskyMergePruner(
-        stems, counts, min_benign_hits=args.min_benign_hits, prune_k=args.prune_k)
+        stems,
+        counts,
+        min_benign_hits=args.min_benign_hits,
+        prune_k=args.prune_k,
+    )
 
-    search = BPESearch(args.base_tokenizer, model_name, anchors, neutrals, u_dev_texts,
-                       score=scorer, candidate_gen=generator, rounds=args.rounds, seed=args.seed)
+    search = BPESearch(
+        args.base_tokenizer,
+        model_name,
+        anchors,
+        neutrals,
+        u_dev_texts,
+        score=scorer,
+        candidate_gen=generator,
+        rounds=args.rounds,
+        seed=args.seed,
+        remap_each_accept=args.remap_each_accept,
+        remap_out=args.remap_out,
+    )
+
     search.initialize_baseline()
     best_merges, best_score = search.search()
-    # Enable optional per-accept remapping
-    search._remap_each_accept = args.remap_each_accept
-    search._remap_out = args.remap_out  # can be "", meaning temp-only
 
     out_dir = Path(args.out)
     editor = search.editor
     editor.write_edited(best_merges, out_dir)
     print(f"[done] wrote searched tokenizer to: {out_dir}")
-    print(f"[best] J={best_score.J:.4f} | ppl={best_score.ppl:.3f} | drift={best_score.drift:.5f} | tpc={best_score.tpc:.5f}")
+    print(
+        f"[best] J={best_score.J:.4f} | ppl={best_score.ppl:.3f} | "
+        f"drift={best_score.drift:.5f} | tpc={best_score.tpc:.5f}"
+    )
+
+    # Round-by-round JSON log (for tables / plots)
+    log_path = out_dir / "bpe_search_log.json"
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "baseline": {
+                    "ppl0": float(ppl0),
+                    "tpc0": float(tpc0),
+                    "drift0": float(drift0),
+                },
+                "rounds": search.history,
+            },
+            f,
+            indent=2,
+        )
+    print(f"[log] wrote search history to: {log_path}")
 
     if args.remap_out:
         # Produce a final remapped model+tokenizer bundle aligned to the best merges
         final_tmp = Path(tempfile.mkdtemp(prefix="bpe_final_"))
         editor.write_edited(best_merges, final_tmp / "tok_final")
         EmbeddingRemapper(
-            base_model_dir=model_name,                     # same LM used for scoring
+            base_model_dir=model_name,  # same LM used for scoring
             new_tokenizer_dir=str(final_tmp / "tok_final"),
             save_dir=args.remap_out,
-            tie_lm_head=True
+            tie_lm_head=True,
         )
         print(f"[done] wrote remapped model+tokenizer to: {args.remap_out}")
 

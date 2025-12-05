@@ -39,6 +39,7 @@ Usage:
 Outputs:
   - <model_prefix>.model / <model_prefix>.vocab (standard SentencePiece artifacts)
   - A companion seed file (<model_prefix>_seed.txt) for reproducibility.
+  - A tiny JSON log (<model_prefix>_hazard_log.json) with lexicon/prior/training summary.
 """
 
 from __future__ import annotations
@@ -48,7 +49,6 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
-from tools.tokenizer_export import spm_to_hf
 
 import sentencepiece as spm
 
@@ -220,7 +220,7 @@ class PriorStrategy:
     """
     Strategy base for computing prior-adjusted scores for seed sentencepieces.
 
-    SentencePiece accepts a seed file with lines: "<piece>\\t<score>".
+    SentencePiece accepts a seed file with lines: "<piece>\t<score>".
     Higher scores mean higher prior likelihood of inclusion.
     """
 
@@ -392,7 +392,7 @@ def make_seed_sentencepieces(lex: HazardLexicon,
 
 def write_seed_file(seed: List[Tuple[str, float]], path: str) -> None:
     """
-    Write a seed sentencepieces text file with "<piece>\\t<score>" per line.
+    Write a seed sentencepieces text file with "<piece>\t<score>" per line.
 
     Args:
         seed: List of (piece, score).
@@ -500,25 +500,31 @@ class SPMHazardTrainer:
               anchors_path: str,
               neutrals_path: str,
               min_stem_len: int = 3,
-              extra_seed: Sequence[str] | None = None) -> Tuple[str, str]:
+              extra_seed: Sequence[str] | None = None) -> Tuple[str, str, dict]:
         """
         Run hazard-aware Unigram training with:
         A) try seeded priors (if supported),
         B) else vanilla + post-EM hazard-aware rescore,
         And auto-fallback from normalization 'nmt' -> 'identity' on Windows wheels lacking 'nmt'.
+
+        Returns:
+            (model_path, vocab_path, train_log_dict)
         """
-        # Build seed
+        # ---- Seed construction ----
         seed_list = make_seed_sentencepieces(
-            lex=self.prior.lex, prior=self.prior, extra_seed=extra_seed, include_hazard_whole_words=True
+            lex=self.prior.lex, prior=self.prior,
+            extra_seed=extra_seed, include_hazard_whole_words=True
         )
-        filtered_seed = [(p, s) for (p, s) in seed_list if self.candidate_filter.keep(p)]
+        filtered_seed = [
+            (p, s) for (p, s) in seed_list if self.candidate_filter.keep(p)
+        ]
         seed_path = f"{self.cfg.model_prefix}_seed.txt"
         write_seed_file(filtered_seed, seed_path)
 
         # Convert JSONL to TXT for SPM if needed
         input_path = self._jsonl_to_txt(self.cfg.corpus)
 
-        # Build base kwargs (safer than a single cmd string on Windows)
+        # Base kwargs (safer than a single cmd string on Windows)
         base_kwargs = dict(
             model_prefix=self.cfg.model_prefix,
             model_type=self.cfg.model_type,
@@ -531,7 +537,6 @@ class SPMHazardTrainer:
             hard_vocab_limit=bool(self.cfg.hard_vocab_limit),
             byte_fallback=bool(self.cfg.byte_fallback),
         )
-        # user_defined_symbols must be a comma-separated string if present
         uds = self._format_user_defined()
         if uds:
             base_kwargs["user_defined_symbols"] = uds
@@ -542,11 +547,15 @@ class SPMHazardTrainer:
             spm.SentencePieceTrainer.Train(**copy.deepcopy(kwargs))
 
         used_seeded = False
+        seeded_norm_name: str | None = None
+        vanilla_norm_name: str | None = None
+        rescore_changed = 0
 
         # ---- Attempt seeded path first ----
         try:
             seeded_kwargs = dict(base_kwargs)
             seeded_kwargs["seed_sentencepieces"] = seed_path
+            seeded_norm_name = seeded_kwargs.get("normalization_rule_name", "nmt")
             _try_train(seeded_kwargs)
             used_seeded = True
             print("[spm_priors] Seeded training path used (seed_sentencepieces).")
@@ -561,6 +570,7 @@ class SPMHazardTrainer:
                 seeded_kwargs = dict(base_kwargs)
                 seeded_kwargs["seed_sentencepieces"] = seed_path
                 seeded_kwargs["normalization_rule_name"] = "identity"
+                seeded_norm_name = "identity"
                 try:
                     _try_train(seeded_kwargs)
                     used_seeded = True
@@ -570,14 +580,17 @@ class SPMHazardTrainer:
                         f"[spm_priors] Seeded+identity failed ({type(e2).__name__}); will try vanilla + rescore.")
             else:
                 print(
-                    f"[spm_priors] Seeded training failed ({type(e).__name__}: {msg[:160]}); will try vanilla + rescore.")
+                    f"[spm_priors] Seeded training failed ({type(e).__name__}: {msg[:160]}); will try vanilla + rescore."
+                )
         except Exception as e:
             print(
-                f"[spm_priors] Seeded training failed ({type(e).__name__}: {str(e)[:160]}); will try vanilla + rescore.")
+                f"[spm_priors] Seeded training failed ({type(e).__name__}: {str(e)[:160]}); will try vanilla + rescore."
+            )
 
         # ---- Vanilla + post-EM rescore if seeded not used ----
         if not used_seeded:
             try:
+                vanilla_norm_name = base_kwargs.get("normalization_rule_name", "nmt")
                 _try_train(base_kwargs)
                 print("[spm_priors] Trained vanilla SPM. Applying hazard-aware post-EM rescore...")
             except OSError as e:
@@ -588,6 +601,7 @@ class SPMHazardTrainer:
                         "[spm_priors] 'nmt' charsmap missing; retrying vanilla with normalization_rule_name='identity'...")
                     vanilla_kwargs = dict(base_kwargs)
                     vanilla_kwargs["normalization_rule_name"] = "identity"
+                    vanilla_norm_name = "identity"
                     _try_train(vanilla_kwargs)
                     print(
                         "[spm_priors] Vanilla SPM succeeded with normalization='identity'. Applying hazard-aware post-EM rescore...")
@@ -595,12 +609,41 @@ class SPMHazardTrainer:
                     raise
 
             model_path = f"{self.cfg.model_prefix}.model"
-            changed = self._rescore_model(model_path, self.prior)
-            print(f"[spm_priors] Rescored {changed} pieces via hazard-aware priors.")
+            rescore_changed = self._rescore_model(model_path, self.prior)
+            print(f"[spm_priors] Rescored {rescore_changed} pieces via hazard-aware priors.")
 
         model_path = f"{self.cfg.model_prefix}.model"
         vocab_path = f"{self.cfg.model_prefix}.vocab"
-        return model_path, vocab_path
+
+        # ---- Tiny JSON summary log ----
+        lex = self.prior.lex
+        max_benign = max(lex.benign_counts.values(), default=0)
+        train_log = {
+            "lexicon": {
+                "num_stems": len(lex.stems),
+                "num_hazard_words": len(lex.hazard_words),
+                "max_benign_count": int(max_benign),
+            },
+            "prior": {
+                "lambda_conf": float(getattr(self.prior, "lambda_conf", 0.0)),
+                "lambda_overlap": float(getattr(self.prior, "lambda_overlap", 0.0)),
+                "hazard_boost": float(getattr(self.prior, "hazard_boost", 0.0)),
+                "base_score": float(getattr(self.prior, "base_score", 0.0)),
+                "count_norm": float(getattr(self.prior, "count_norm", 1.0)),
+            },
+            "seed": {
+                "path": seed_path,
+                "num_seed_pieces": len(filtered_seed),
+            },
+            "training": {
+                "used_seeded": bool(used_seeded),
+                "seeded_normalization": seeded_norm_name,
+                "vanilla_normalization": vanilla_norm_name,
+                "rescore_changed_pieces": int(rescore_changed),
+            },
+        }
+
+        return model_path, vocab_path, train_log
 
 
 # ---------------------------------------------------------------------
@@ -611,7 +654,7 @@ def build_cli() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Train hazard-aware SPM (Unigram) with token-level priors.")
     p.add_argument("--corpus", required=True,
-                   help="Path to training text corpus (one sentence per line).")
+                   help="Path to training text corpus (one sentence per line, or JSONL with 'text').")
     p.add_argument("--anchors", required=True, help="JSONL with {'text': ...} hazard anchors.")
     p.add_argument("--neutrals", required=True,
                    help="JSONL with {'text': ...} neutral look-alikes.")
@@ -666,8 +709,8 @@ def main():
     ud_list = []
     if args.addl_special:
         ud_list.extend([s for s in args.addl_special.split(",") if s])
-    # SPM uses user_defined_symbols for arbitrary specials (not BOS/EOS). We still register extras here.
     uds = [s for s in ud_list] if ud_list else None
+
     cfg = SPMConfig(
         model_prefix=args.model_prefix,
         vocab_size=args.vocab_size,
@@ -702,9 +745,10 @@ def main():
     )
 
     # Candidate filter
-    cand_filter: CandidateFilter
     if args.drop_risky_substrings:
-        cand_filter = DropRiskySubstrings(lex=lex, min_len=args.min_substring_len, drop_if_in=True)
+        cand_filter: CandidateFilter = DropRiskySubstrings(
+            lex=lex, min_len=args.min_substring_len, drop_if_in=True
+        )
     else:
         cand_filter = KeepAllFilter()
 
@@ -716,7 +760,7 @@ def main():
 
     # Train
     trainer = SPMHazardTrainer(cfg=cfg, prior=prior, candidate_filter=cand_filter)
-    model_path, vocab_path = trainer.train(
+    model_path, vocab_path, train_log = trainer.train(
         anchors_path=args.anchors,
         neutrals_path=args.neutrals,
         min_stem_len=args.min_stem_len,
@@ -726,6 +770,12 @@ def main():
     print(f"[done] wrote SPM model: {model_path}")
     print(f"[done] wrote SPM vocab: {vocab_path}")
     print(f"[note] hazard-aware seed written to: {cfg.model_prefix}_seed.txt")
+
+    # Tiny JSON log
+    log_path = f"{cfg.model_prefix}_hazard_log.json"
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(train_log, f, indent=2)
+    print(f"[log] wrote hazard-aware SPM summary to: {log_path}")
 
     # Optional: export to a HF fast tokenizer folder with declared special tokens
     if args.export_hf_dir:
@@ -739,12 +789,13 @@ def main():
         }
         base_model = target_to_base.get(args.hf_target, None)
 
-        # Let users override via explicit flag (add this flag in build_cli below)
+        # Let users override via explicit flag (add this flag in build_cli below if needed)
         if getattr(args, "hf_base_model", None):
             base_model = args.hf_base_model
 
         # Use the dedicated exporter (writes tokenizer.json + tokenizer_config.json)
         try:
+            from tools.tokenizer_export import spm_to_hf
             out_dir = spm_to_hf(model_path, args.export_hf_dir, base_model=base_model)
         except Exception as e:
             raise RuntimeError(
