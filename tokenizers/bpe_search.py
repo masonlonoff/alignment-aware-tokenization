@@ -180,7 +180,7 @@ def tokens_per_char(tok: PreTrainedTokenizerFast, texts: List[str]) -> float:
     Returns:
         Mean tokens per character (float).
     """
-    total_toks = total_chars = 0vs
+    total_toks = total_chars = 0
     for t in texts:
         if not t:
             continue
