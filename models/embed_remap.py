@@ -178,7 +178,7 @@ class EmbeddingRemapper:
             if average_pool:
                 ids = _tokenize_old(old_tok, piece)
                 if len(ids) > 0:
-                    vec = old_emb[torch.tensor(ids, device=old_emb.device)].mean(0).to(device=dtype)
+                    vec = old_emb[torch.tensor(ids, device=old_emb.device)].mean(0).to(device=device, dtype=dtype)
 
             # 3) fallback NN by cosine on old pieces
             if vec is None and old_norm is not None:
