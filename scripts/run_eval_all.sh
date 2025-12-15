@@ -7,7 +7,7 @@ python -m eval.eval_drift --config configs/pythia410m.yml --probe probes/v_layer
 python -m eval.eval_jailbreak \
   --config configs/llm_eval.yml \
   --probe probes/v_layer.pt.npy \
-  --model_name adapters/pythia410m-bpe-searched-remap \ # make sure to change to your adapter path
+  --model_name mistralai/Mistral-7B-v0.1 \ # make sure to change to your adapter path
   --atk_n 1000 \
   --benign_n 1500 \
   --calib_n 256 \
@@ -21,7 +21,7 @@ python -m eval.eval_jailbreak \
   --dedup_attacks
   
 python -m eval.seg_stability \
-  --tokenizer tokenizers/bpe_searched.json \
+  --tokenizer tokenizers/bpe_searched \
   --texts data/eval/benign_1500.jsonl \
   --key text \
   --max_texts 400 \
@@ -30,3 +30,8 @@ python -m eval.seg_stability \
   --bootstrap 800 \
   --seed 9172
 
+python -m eval.label_efficiency --config configs/pythia410m.yml --budgets 50 100 300 --trials 10 --check_overlap --dedup
+python -m eval.label_efficiency --config configs/pythia1_4b.yml --budgets 50 100 300 --trials 10 --check_overlap --dedup
+python -m eval.label_efficiency --config configs/mistral7b.yml   --budgets 50 100 300 --trials 10 --check_overlap --dedup
+python -m eval.label_efficiency --config configs/llama3_8b.yml --budgets 50 100 300 --trials 10 --check_overlap --dedup
+python -m eval.label_efficiency --config configs/qwen2_7b.yml --budgets 50 100 300 --trials 10 --check_overlap --dedup
