@@ -146,6 +146,13 @@ def main(args):
         low_cpu_mem_usage=True,
     ).to(device).eval()
 
+    if model.config.vocab_size < tok.vocab_size:
+        print(
+            f"[warn] model vocab_size={model.config.vocab_size} < tokenizer vocab_size={tok.vocab_size}; "
+            "resizing token embeddings (new tokens will be randomly initialized)."
+        )
+        model.resize_token_embeddings(tok.vocab_size)
+
     ppl = perplexity(model, tok, texts, batch_size=bs, max_length=max_len)
     print(f"Perplexity: {ppl:.3f}")
 

@@ -74,6 +74,16 @@ def _load_model_and_tokenizer(cfg):
     # Tokenizer may live in a local folder -> always safe to load via AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tok_id, use_fast=True)
 
+    # Ensure padding exists (Llama-3, some Mistral/Qwen variants)
+    if tok.pad_token_id is None:
+        # prefer EOS as PAD to avoid changing vocab size
+        if tok.eos_token is not None:
+            tok.pad_token = tok.eos_token
+        else:
+            # last resort: add a new PAD token (rarely needed here)
+            tok.add_special_tokens({"pad_token": "[PAD]"})
+    tok.padding_side = "right"
+
     # First, try to load `model_id` as a full HF model
     try:
         model = _load_with_dtype(model_id, dtype=dtype)

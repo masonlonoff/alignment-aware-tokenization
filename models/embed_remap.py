@@ -156,8 +156,8 @@ class EmbeddingRemapper:
         V_old, H = old_emb.shape
         piece_to_id_old = _build_piece_to_id(old_tok)
 
-        # Build new embedding matrix
-        V_new = new_tok.vocab_size
+        # 🔧 IMPORTANT: use *len(tokenizer)*, not vocab_size, so we include added tokens.
+        V_new = len(new_tok)
         new_weight = torch.empty((V_new, H), dtype=dtype, device=device)
 
         # Precompute normalized matrix for cheap cosine-NN if needed
@@ -167,6 +167,8 @@ class EmbeddingRemapper:
         # For fast tokenizers, `convert_ids_to_tokens(i)` gets the string
         for i in range(V_new):
             piece = new_tok.convert_ids_to_tokens(i)
+            if piece is None:
+                piece = ""
 
             # 1) exact copy
             if piece in piece_to_id_old:
@@ -178,20 +180,22 @@ class EmbeddingRemapper:
             if average_pool:
                 ids = _tokenize_old(old_tok, piece)
                 if len(ids) > 0:
-                    vec = old_emb[torch.tensor(ids, device=old_emb.device)].mean(0).to(device=device, dtype=dtype)
+                    vec = old_emb[
+                        torch.tensor(ids, device=old_emb.device)
+                    ].mean(0).to(device=device, dtype=dtype)
 
             # 3) fallback NN by cosine on old pieces
             if vec is None and old_norm is not None:
-                # Represent the *string* by averaging its character-level encoding under old tok;
-                # If empty, build a naive TF-like char id list just to get a direction.
                 ids = _tokenize_old(old_tok, piece)
                 if ids:
-                    target = F.normalize(old_emb[torch.tensor(
-                        ids, device=old_emb.device)].mean(0).unsqueeze(0), dim=1)
+                    target = F.normalize(
+                        old_emb[torch.tensor(ids, device=old_emb.device)].mean(0).unsqueeze(0),
+                        dim=1,
+                    )
                     sims = (old_norm @ target.T).squeeze(1)  # [V_old]
                     topk = min(self.nn_fallback_topk, V_old)
                     nn_ix = torch.topk(sims, k=topk, dim=0).indices
-                    vec = old_emb[nn_ix].mean(0).to(device=dtype)
+                    vec = old_emb[nn_ix].mean(0).to(device=device, dtype=dtype)
                 else:
                     # Last resort: zero init (rare)
                     vec = torch.zeros(H, dtype=dtype, device=device)
@@ -199,11 +203,39 @@ class EmbeddingRemapper:
             new_weight[i] = vec
 
         # Write back
-        model.get_input_embeddings().weight.data[:] = new_weight
+        input_emb = model.get_input_embeddings()
+        old_n, d_old = input_emb.weight.shape
+        new_n, d_new = new_weight.shape
 
-        # If tied lm_head exists, mirror the weights
-        lm_head_w = self._maybe_get_lm_head(model)
-        if update_lm_head and lm_head_w is not None and lm_head_w.shape == new_weight.shape:
-            lm_head_w.data[:] = new_weight
+        if d_old != d_new:
+            raise ValueError(
+                f"Hidden size mismatch between model emb ({d_old}) and new_weight ({d_new})."
+            )
+
+        # If vocab sizes differ, resize model embeddings to new_n
+        if new_n != old_n:
+            # this will resize both input and output embeddings if tie_word_embeddings=True
+            model.resize_token_embeddings(new_n)
+            input_emb = model.get_input_embeddings()
+
+        # Copy new weights into resized embedding matrix
+        input_emb.weight.data.copy_(
+            new_weight.to(input_emb.weight.device, dtype=input_emb.weight.dtype)
+        )
+
+        # Optionally tie / copy into LM head as well
+        if update_lm_head:
+            out_emb = model.get_output_embeddings()
+            if out_emb is not None and out_emb.weight.shape == new_weight.shape:
+                out_emb.weight.data.copy_(
+                    new_weight.to(out_emb.weight.device, dtype=out_emb.weight.dtype)
+                )
+
+            # If tied lm_head exists, mirror the weights
+            lm_head_w = self._maybe_get_lm_head(model)
+            if lm_head_w is not None and lm_head_w.shape == new_weight.shape:
+                lm_head_w.data[:] = new_weight.to(
+                    lm_head_w.device, dtype=lm_head_w.dtype
+                )
 
         return model

@@ -64,7 +64,8 @@ def _read_jsonl(path: str) -> List[str]:
 @torch.no_grad()
 def concept_scores(model_feat: AutoModel, tok, v_np: np.ndarray,
                    texts: List[str], layer: int, bs: int = 32) -> np.ndarray:
-    device = model_feat.device
+    # 🔧 more robust device detection
+    device = next(model_feat.parameters()).device
     v = torch.as_tensor(v_np, dtype=torch.float32, device=device).reshape(-1)
     out_scores = []
     for i in range(0, len(texts), bs):
@@ -81,12 +82,23 @@ def concept_scores(model_feat: AutoModel, tok, v_np: np.ndarray,
 def gen_batch(gen_model, tok, prompts: List[str], max_new_tokens: int,
               greedy: bool, temperature: float, top_p: float, bs: int = 8) -> List[str]:
     """Return only continuations (prompt stripped) for each prompt, in-order."""
-    device = gen_model.device
+    # 🔧 more robust device detection
+    device = next(gen_model.parameters()).device
     gens_all: List[str] = []
     for i in range(0, len(prompts), bs):
         batch = prompts[i:i + bs]
-        enc = tok(batch, return_tensors="pt", padding=True, truncation=True,
-                  max_length=512, pad_to_multiple_of=8).to(device)
+        enc = tok(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+            pad_to_multiple_of=8,
+        ).to(device)
+
+        # 🔧 DROP token_type_ids for decoder-only models (Mistral/Pythia/Qwen/LLaMA/etc.)
+        if "token_type_ids" in enc:
+            enc.pop("token_type_ids")
 
         # Build generation kwargs; omit sampling args in greedy mode.
         gen_kwargs = dict(max_new_tokens=max_new_tokens, num_beams=1, use_cache=True)
@@ -95,7 +107,12 @@ def gen_batch(gen_model, tok, prompts: List[str], max_new_tokens: int,
         else:
             gen_kwargs.update(dict(do_sample=False))
 
-        out = gen_model.generate(**enc, **gen_kwargs)
+        # Important: we still pass input_ids and attention_mask
+        out = gen_model.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc.get("attention_mask", None),
+            **gen_kwargs,
+        )
 
         # Strip prompts to keep only the continuation
         for row, ids in enumerate(out):
@@ -113,6 +130,28 @@ def bootstrap_ci(p: float, n: int, B: int = 1000, alpha: float = 0.05) -> Tuple[
     z = norm.ppf(1 - alpha / 2)
     lo, hi = p - z * se, p + z * se
     return max(0.0, lo), min(1.0, hi)
+
+
+# 🔧 helper: load models with safe attention implementation for Qwen/LLaMA/Mistral/etc.
+def _load_with_attn(cls, name: str, dtype: torch.dtype, device: torch.device):
+    """
+    Load model with a safe attention implementation for decoder-only LMs.
+    Uses attn_implementation='eager' when supported to avoid SDPA/sliding-window
+    CUDA asserts on some configs.
+    """
+    try:
+        model = cls.from_pretrained(
+            name,
+            dtype=dtype,
+            attn_implementation="eager",
+        )
+    except TypeError:
+        # Older transformers may not support `dtype` / `attn_implementation`
+        model = cls.from_pretrained(
+            name,
+            torch_dtype=dtype,
+        )
+    return model.to(device).eval()
 
 
 def main():
@@ -159,15 +198,20 @@ def main():
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
     model_name = args.model_name or cfg.get("tokenizer_name", cfg.get("model_name"))
 
+    # 🔧 device & dtype (shared)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+
     # Tokenizer
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token or tok.unk_token
-    tok.padding_side = "left"  # better batching for causal models
+    # 🔧 use RIGHT padding (simpler with eager attention)
+    tok.padding_side = "right"
 
-    # Models
-    gen = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda").eval()
-    feat = AutoModel.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda").eval()
+    # Models (use safe-attention loader)
+    gen = _load_with_attn(AutoModelForCausalLM, model_name, dtype, device)
+    feat = _load_with_attn(AutoModel,          model_name, dtype, device)
 
     # Optional LoRA adapter on BOTH models
     if args.adapter:
@@ -178,12 +222,14 @@ def main():
         gen = PeftModel.from_pretrained(gen, args.adapter).eval()
         feat = PeftModel.from_pretrained(feat, args.adapter).eval()
         # Merge for a small speed boost; comment out if you prefer raw adapters:
-        gen = gen.merge_and_unload()
-        feat = feat.merge_and_unload()
+        # gen = gen.merge_and_unload()
+        # feat = feat.merge_and_unload()
 
     # Ensure pad_token is respected during generation
     try:
         gen.generation_config.pad_token_id = tok.pad_token_id
+        if tok.eos_token_id is not None:
+            gen.generation_config.eos_token_id = tok.eos_token_id
     except Exception:
         pass
 

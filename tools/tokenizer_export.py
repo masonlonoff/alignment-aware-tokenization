@@ -7,14 +7,13 @@ model (recommended: use the LM you plan to fine-tune, e.g., LLaMA/Mistral/Qwen).
 
 Typical usage:
   python -m tools.tokenizer_export \
-    --spm_model tokenizers/spm_hazard/spm.model \
-    --out_dir tokenizers/spm_hazard \
-    --base_model meta-llama/Meta-Llama-3-8B
+    --spm_model tokenizers/spm_hazard/spm_mistral7b_hazard.model \
+    --out_dir tokenizers/spm_hazard/hf_mistral7b_hazard \
+    --base_model mistralai/Mistral-7B-v0.1
 
 Outputs:
-  - tokenizers/spm_hazard/tokenizer.json
-  - tokenizers/spm_hazard/tokenizer_config.json
-  - (keeps spm.model / spm.vocab from prior step if present)
+  - <out_dir>/tokenizer.json
+  - <out_dir>/tokenizer_config.json
 """
 
 from __future__ import annotations
@@ -25,8 +24,9 @@ import os
 from typing import Optional
 
 from tokenizers import normalizers, pre_tokenizers, decoders, Tokenizer
-from tokenizers.implementations import SentencePieceUnigramTokenizer
+from tokenizers.models import Unigram
 from transformers import PreTrainedTokenizerFast, AutoTokenizer
+from sentencepiece import sentencepiece_model_pb2 as spmp
 
 
 def _load_specials_from_base(base_model: str) -> dict:
@@ -44,8 +44,11 @@ def _load_specials_from_base(base_model: str) -> dict:
 
 def _default_specials() -> dict:
     """Sensible defaults for Unigram/SentencePiece-style tokenizers."""
-    # Many SPM LMs use <unk>, and rely on BOS/EOS; pad is optional.
-    return {"unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
+    return {
+        "unk_token": "<unk>",
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+    }
 
 
 def spm_to_hf(spm_model_path: str, out_dir: str, base_model: Optional[str] = None) -> str:
@@ -58,38 +61,85 @@ def spm_to_hf(spm_model_path: str, out_dir: str, base_model: Optional[str] = Non
         base_model: optional HF model to copy special tokens from
 
     Returns:
-        out_dir (so callers can chain operations)
+        out_dir
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1) Load as a tokenizers SentencePieceUnigramTokenizer
-    sp_tok = SentencePieceUnigramTokenizer(spm_model_path)
+    # -------------------------------------------------------------
+    # 1) Read the SentencePiece .model via the official proto
+    # -------------------------------------------------------------
+    proto = spmp.ModelProto()
+    with open(spm_model_path, "rb") as f:
+        proto.ParseFromString(f.read())
 
-    # 2) Ensure a standard normalizer & pre-tokenizer & decoder (SentencePiece defaults)
-    #    (SentencePieceUnigramTokenizer sets these appropriately, but we make it explicit.)
-    tok: Tokenizer = sp_tok._tokenizer
+    # Build vocab list: [(piece, score), ...]
+    vocab = [(p.piece, p.score) for p in proto.pieces]
+
+    # Find unk_id from the SentencePiece proto
+    unk_id = None
+    for i, p in enumerate(proto.pieces):
+        if (
+            p.type == spmp.ModelProto.SentencePiece.Type.UNKNOWN
+            or p.piece == "<unk>"
+        ):
+            unk_id = i
+            break
+
+    # Fallback: assume first piece is unk if nothing was explicitly marked
+    if unk_id is None:
+        unk_id = 0
+
+    # Create Unigram model with a valid unk_id
+    model = Unigram(vocab, unk_id=unk_id)
+    tok: Tokenizer = Tokenizer(model)
+
+    # -------------------------------------------------------------
+    # 2) Normalizer / pre-tokenizer / decoder (SPM-like)
+    # -------------------------------------------------------------
     tok.normalizer = normalizers.Sequence([normalizers.NFKC()])
-    tok.pre_tokenizer = pre_tokenizers.Sequence(
-        [pre_tokenizers.Metaspace(replacement="▁", add_prefix_space=True)])
-    tok.decoder = decoders.Metaspace(replacement="▁", add_prefix_space=True)
 
-    # 3) Wrap with HF fast tokenizer
+    # Metaspace API changed across tokenizers versions; be defensive.
+    try:
+        metaspace_pretok = pre_tokenizers.Metaspace(
+            replacement="▁", add_prefix_space=True
+        )
+    except TypeError:
+        metaspace_pretok = pre_tokenizers.Metaspace(replacement="▁")
+
+    try:
+        metaspace_dec = decoders.Metaspace(
+            replacement="▁", add_prefix_space=True
+        )
+    except TypeError:
+        metaspace_dec = decoders.Metaspace(replacement="▁")
+
+    tok.pre_tokenizer = pre_tokenizers.Sequence([metaspace_pretok])
+    tok.decoder = metaspace_dec
+
+    # -------------------------------------------------------------
+    # 3) Wrap with HF fast tokenizer and save
+    # -------------------------------------------------------------
     specials = _load_specials_from_base(base_model) if base_model else _default_specials()
+
     hf_fast = PreTrainedTokenizerFast(
         tokenizer_object=tok,
         **specials,
     )
 
-    # 4) Save in HF format
     hf_fast.save_pretrained(out_dir)
 
-    # Also write a tiny tokenizer_config supplement (optional, but handy for clarity)
+    # Patch tokenizer_config.json with a couple of handy fields
     cfg_path = os.path.join(out_dir, "tokenizer_config.json")
     if os.path.exists(cfg_path):
         cfg = json.load(open(cfg_path, "r", encoding="utf-8"))
     else:
         cfg = {}
-    cfg.update({"model_max_length": 4096, "tokenizer_class": "PreTrainedTokenizerFast"})
+    cfg.update(
+        {
+            "model_max_length": 4096,
+            "tokenizer_class": "PreTrainedTokenizerFast",
+        }
+    )
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 

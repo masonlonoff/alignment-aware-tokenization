@@ -4,6 +4,7 @@ import yaml
 import numpy as np
 import torch
 import os
+from peft import PeftModel, PeftConfig
 from transformers import AutoTokenizer, AutoModel
 from sklearn.linear_model import LogisticRegression
 from utils.seeding import set_global_seed, log_run_meta
@@ -96,14 +97,38 @@ def main(args):
         # optional env hint for fragmentation
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    model_name = cfg.get("tokenizer_name", cfg["model_name"])
+        # --- Separate model id vs tokenizer id ---
+    model_id = cfg["model_name"]  # HF base model or PEFT adapter dir
+    tok_id = cfg.get("tokenizer_name", cfg["model_name"])
+
     model_kwargs = {"dtype": dtype}
     if user_attn_impl in ("sdpa", "eager"):  # optional override
         model_kwargs["attn_implementation"] = user_attn_impl
 
-    model = AutoModel.from_pretrained(model_name, **model_kwargs).to(device).eval()
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    # Load tokenizer (can be local HF tokenizer folder)
+    tok = AutoTokenizer.from_pretrained(tok_id, use_fast=True)
     ensure_padding(tok)
+
+    # Try to load model_id as a full HF model first
+    try:
+        model = AutoModel.from_pretrained(model_id, **model_kwargs)
+        model = model.to(device).eval()
+    except Exception:
+        # If that fails, assume model_id is a PEFT adapter directory.
+        # In that case, load base model from tok_id and attach the adapter.
+        base_model = AutoModel.from_pretrained(tok_id, **model_kwargs)
+        base_model = base_model.to(device).eval()
+
+        try:
+            _ = PeftConfig.from_pretrained(model_id)
+        except Exception as e:
+            raise ValueError(
+                f"`model_name`='{model_id}' is neither a valid HF model nor a PEFT adapter dir. "
+                f"Original error: {type(e).__name__}: {e}"
+            )
+
+        model = PeftModel.from_pretrained(base_model, model_id)
+        model = model.to(device).eval()
 
     H = load_texts(cfg["data"]["anchors"])
     N = load_texts(cfg["data"]["neutrals"])
