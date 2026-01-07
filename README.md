@@ -5,7 +5,7 @@ This repository contains the final project report and reference materials for **
 This project was completed as a final course project and presents novel research contributions, rather than a production system or fully packaged library. 
 
 **Project Report**:
-['alignment_aware_tokenization.pdf'](./alignment_aware_tokenization.pdf)
+[alignment_aware_tokenization.pdf](./alignment_aware_tokenization.pdf)
 
 
 ## Research Motivation
