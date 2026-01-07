@@ -38,7 +38,7 @@ The emphasis is on conceptual alignment effects, not on maximizing benchmark per
 - Tokenization choices can meaningfully affect safety-relevant internal representations, even without changing model architecture.
 - Hazard probes trained with very few labels saturate quickly, making them practical for low-resource alignment analysis.
 - For Unigram tokenizers, tokenizer-only changes can strongly mismatch pretrained weights, highlighting the need for paired adaptation.
-- Alignment behavior emerges from interactions between tokenization, representation learning, and fine-tuning**, not from any single component.
+- Alignment behavior emerges from interactions between tokenization, representation learning, and fine-tuning, not from any single component.
 
 Detailed quantitative results and analysis are provided in the project report.
 
